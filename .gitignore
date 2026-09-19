@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor/OS cruft
+.DS_Store
+*.swp
+
+# Local overrides some people keep alongside docker-bake.hcl
+docker-bake.override.hcl
