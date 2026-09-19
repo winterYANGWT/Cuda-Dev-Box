@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Cuda-Dev-Box host tool.
+
+  devbox create          interactively create an SSH dev container
+  devbox memory          preview or install host HugeTLB/CMA/NUMA settings
+  devbox agent install   install the persistent host SSH agent (one-time)
+  devbox agent refresh   restart a container's fallback SSH agent proxy
+
+Run `devbox <command> --help` for each command's options.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from devbox_lib import container, memory, ssh_agent  # noqa: E402
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="devbox", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    container.add_parser(subparsers)
+    memory.add_parser(subparsers)
+    ssh_agent.add_parser(subparsers)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as error:
+        # The failing command already printed its own error (e.g. Docker's).
+        raise SystemExit(f"devbox: command failed (exit {error.returncode}): {' '.join(error.cmd)}")
+    except KeyboardInterrupt:
+        raise SystemExit(130)
