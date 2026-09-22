@@ -24,7 +24,6 @@ IMAGE_REPOSITORY = "cuda-devbox"
 IMAGE_VERSION_TAG = re.compile(r"\d{6}")
 # Docker's name rule, capped at 63 for the hostname; it also keeps the name one safe path component.
 CONTAINER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}")
-LEGACY_PRIVATE_KEY_NAMES = ("id_ed25519", "id_rsa", "id_ecdsa")
 # The image EXPOSEs 8000-8099; the host side is START..START+99.
 CONTAINER_DEV_PORT_START = 8000
 CONTAINER_DEV_PORT_COUNT = 100
@@ -84,16 +83,6 @@ def write_authorized_keys(ssh_dir, public_keys):
             authorized_keys.write("\n".join(public_keys) + "\n")
     os.chmod(authorized_keys_path, 0o600)
     return authorized_keys_path
-
-
-def remove_legacy_private_keys(ssh_dir):
-    removed = []
-    for filename in LEGACY_PRIVATE_KEY_NAMES:
-        path = os.path.join(ssh_dir, filename)
-        if os.path.isfile(path):
-            os.remove(path)
-            removed.append(path)
-    return removed
 
 
 def build_root_password():
@@ -479,22 +468,11 @@ def run(args):
         if not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
 
-    removed_private_keys = remove_legacy_private_keys(ssh_dir)
-    if removed_private_keys:
-        print(f"Removed {len(removed_private_keys)} legacy private key file(s) from {ssh_dir}")
-
     host_ssh_dir = os.path.expanduser("~/.ssh")
+    # The host is the only source, so a key revoked there loses access here on recreation.
     public_keys = collect_public_keys(host_ssh_dir)
-    # Preserve keys already used to reach this container when recreating it.
-    existing_keys_path = os.path.join(ssh_dir, "authorized_keys")
-    if os.path.isfile(existing_keys_path):
-        with open(existing_keys_path, "r", encoding="utf-8") as existing_keys:
-            for line in existing_keys:
-                key = line.strip()
-                if key and not key.startswith("#") and key not in public_keys:
-                    public_keys.append(key)
     if key_only and not public_keys:
-        raise SystemExit("SSH key-only mode requires at least one public key in ~/.ssh/*.pub, ~/.ssh/authorized_keys, or the container authorized_keys.")
+        raise SystemExit("SSH key-only mode requires at least one public key in ~/.ssh/*.pub or ~/.ssh/authorized_keys.")
     authorized_keys_path = write_authorized_keys(ssh_dir, public_keys)
     if public_keys:
         print(f"Injected {len(public_keys)} public key(s) into {authorized_keys_path}")
