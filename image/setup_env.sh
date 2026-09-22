@@ -4,6 +4,7 @@ set -euo pipefail
 for name in \
     CUDA_HOME GOROOT CARGO_HOME RUSTUP_HOME \
     JAVA_HOME MAVEN_HOME GRADLE_HOME KOTLIN_HOME \
+    CLAUDE_CONFIG_DIR NPM_CONFIG_PREFIX NPM_CONFIG_USERCONFIG \
     TZ LANG LANGUAGE LC_ALL CC CXX; do
     if [ -z "${!name:-}" ]; then
         echo "ERROR: required environment variable $name is not set" >&2
@@ -22,6 +23,9 @@ profile=/etc/profile.d/dev-tools.sh
     printf 'export MAVEN_HOME=%q\n' "$MAVEN_HOME"
     printf 'export GRADLE_HOME=%q\n' "$GRADLE_HOME"
     printf 'export KOTLIN_HOME=%q\n' "$KOTLIN_HOME"
+    printf 'export CLAUDE_CONFIG_DIR=%q\n' "$CLAUDE_CONFIG_DIR"
+    printf 'export NPM_CONFIG_PREFIX=%q\n' "$NPM_CONFIG_PREFIX"
+    printf 'export NPM_CONFIG_USERCONFIG=%q\n' "$NPM_CONFIG_USERCONFIG"
     printf 'export TZ=%q\n' "$TZ"
     printf 'export LANG=%q\n' "$LANG"
     printf 'export LANGUAGE=%q\n' "$LANGUAGE"
