@@ -163,7 +163,7 @@ host/devbox create
 
 It takes no options; every setting is asked for. For example, for SSH port `61000`, dev ports `62000–62099`, and key-only login, answer the dev-port start with `62000`, the SSH port with `61000`, and the password-login question with `y`.
 
-Press Enter at the image-tag prompt to take `cuda-devbox:latest` (or the newest local `cuda-devbox:YYYYMM` build if `latest` is absent). You can also type another tag such as `202608`, or a full image name such as `other/image:1.0`. For a plain container, answer `n` to the SSH agent, sandbox compatibility, privileged mode, and kernel passthrough prompts. The dev ports are always 100 consecutive host ports starting at the start port, mapped onto container `8000-8099`: start `62000` gives host `62000-62099` (host `62080` reaches a service on container port `8080`). The SSH port can't fall inside that host range. Key-only login disables password login and requires a public key. The GPU question is only asked when Docker can actually use the GPU; otherwise the script warns and leaves the GPU out. The container's `authorized_keys` gets the host's own `~/.ssh/*.pub` plus every key in the host's `~/.ssh/authorized_keys` (so a laptop that can SSH into the host can SSH into the container too; lines with options such as `from=` are skipped), and recreating a container keeps the entries already in its data directory. The `~/.gitconfig` mount is skipped if the host doesn't have one.
+Press Enter at the image-tag prompt to take `cuda-devbox:latest` (or the newest local `cuda-devbox:YYYYMM` build if `latest` is absent). You can also type another tag such as `202608`, or a full image name such as `other/image:1.0`. For a plain container, answer `n` to the SSH agent, sandbox compatibility, privileged mode, and kernel passthrough prompts. The dev ports are always 100 consecutive host ports starting at the start port, mapped onto container `8000-8099`: start `62000` gives host `62000-62099` (host `62080` reaches a service on container port `8080`). The SSH port can't fall inside that host range. Key-only login disables password login and requires a public key. The GPU question is only asked when Docker can actually use the GPU; otherwise the script warns and leaves the GPU out. The container's `authorized_keys` gets the host's own `~/.ssh/*.pub` plus every key in the host's `~/.ssh/authorized_keys` (so a laptop that can SSH into the host can SSH into the container too; lines with options such as `from=` are skipped). The host is the only source: every create rewrites the file, so recreating a container drops keys that are no longer on the host and keys added inside the container. Private keys in the container's `.ssh` are left alone. The `~/.gitconfig` mount is skipped if the host doesn't have one.
 
 The GPU selection defaults to `all`; enter `0,2` for individual host GPU indices, `0-3` for an inclusive range, or `0,2-4` to combine them. Repeated indices are removed, and malformed inputs are re-asked. For example, `0,2-3` becomes Docker's `--gpus '"device=0,2,3"'`. Use `nvidia-smi -L` on the host to see its GPU indices.
 
@@ -232,14 +232,14 @@ If the host is missing `/dev/hugepages`, `/dev/dma_heap`, `/dev/udmabuf`, or the
 
 In nonprivileged mode (specific GPU indices, or answering `n` at the privileged-mode prompt), the script appends capabilities based on what else you enabled. Cursor/Claude sandbox compatibility adds `SYS_ADMIN`, `NET_ADMIN`, `seccomp=unconfined`, `apparmor=unconfined`; kernel dev passthrough adds `IPC_LOCK`, `SYS_RESOURCE`, `SYS_ADMIN`, `SYS_PTRACE`, `BPF`, `PERFMON`, and `seccomp=unconfined`. With `--privileged`, none of these `--cap-add`/unconfined security opts get appended again since they'd be redundant.
 
-If SSH agent forwarding is enabled, the script installs the persistent host agent if needed, starts it if stopped, and waits for its socket to become ready. If the agent has no keys, it runs `ssh-add` on the host to load the standard `~/.ssh/id_*` identities; encrypted keys prompt for their passphrase in the terminal. An agent that already has keys is reused. Installation or key-loading failure stops creation before Docker creates a container. The script then appends:
+If SSH agent forwarding is enabled, the script installs the persistent host agent if needed, starts it if stopped, and waits for its socket to become ready. If the agent has no keys, it runs `ssh-add` on the host with every private key in `~/.ssh` that has a matching `.pub`, custom file names included: Ed25519 first, then ECDSA, then RSA, so the container offers the Ed25519 key first to services such as GitHub. Other key types, such as DSA, are skipped. Encrypted keys prompt for their passphrase in the terminal. With no such key, the script warns and continues with an empty agent. An agent that already has keys is reused. Installation or key-loading failure stops creation before Docker creates a container. The script then appends:
 
 ```bash
     -v ~/.ssh-agent:/ssh-agent \
     -e SSH_AUTH_SOCK=/ssh-agent/docker-agent.sock
 ```
 
-No separate setup command is required before `devbox create`. To set up the agent in advance or load a key with a custom filename:
+No separate setup command is required before `devbox create`. To set up the agent in advance, or to load a key that has no `.pub` next to it:
 
 ```bash
 host/devbox agent install
@@ -252,7 +252,7 @@ This maintains `~/.ssh-agent/docker-agent.sock` via a user systemd service. Dock
 sudo loginctl enable-linger "$USER"
 ```
 
-Run creation as your normal host user with access to Docker and a working user systemd session. An empty agent needs a local private key for `ssh-add`; a forwarded login-session agent's keys cannot be copied into the persistent agent. Keys live in agent memory and need to be added again after a host reboot.
+Run creation as your normal host user with access to Docker and a working user systemd session. An empty agent needs a local private key for `ssh-add`; a forwarded login-session agent's keys cannot be copied into the persistent agent. Keys live in agent memory and need to be added again after a host reboot. If the private key lives only on another machine such as your laptop, connect to the container with `ssh -A` instead: SSH sessions then use the forwarded agent and don't need the persistent one.
 
 This only lets processes inside the container request signatures from the agent; it never copies the host's private key into the container. Containers restart cleanly after a host reboot; if a container can't find an agent key when reaching a private repo, first try re-adding the key to the persistent agent:
 
@@ -265,8 +265,6 @@ Older containers may use a per-container proxy at `~/docker_mount/<container-nam
 ```bash
 host/devbox agent refresh <container-name>
 ```
-
-If an older version of this script left `id_ed25519`, `id_rsa`, or `id_ecdsa` in `~/docker_mount/<container-name>/.ssh`, the current version removes those legacy private key files before creating the container.
 
 With host Docker access enabled (the default), the script also appends:
 
