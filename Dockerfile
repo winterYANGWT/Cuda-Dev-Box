@@ -1,10 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Every build ARG, all declared up front. None of these have defaults on
-# purpose: this Dockerfile has no opinion of its own about versions, only
-# docker-bake.hcl does. A plain `docker build .` with nothing supplied fails
-# immediately rather than silently building something unintended. Build with
-# `docker buildx bake`, or pass every one of these via --build-arg yourself.
+# Build with: docker build -t cuda-devbox:latest .
+# Version defaults live here; override any one with --build-arg NAME=value.
 #
 # ARGs declared here (global scope) are usable in any FROM line below, but
 # NOT automatically inside a stage's RUN/COPY — each stage that needs one
@@ -12,35 +9,34 @@
 # See the re-declarations at each stage below.
 #
 # Base images, repository and tag as separate ARGs.
-ARG UV_REPO
-ARG UV_TAG
-ARG GO_REPO
-ARG GO_TAG
-ARG JAVA_REPO
-ARG JAVA_TAG
-ARG MAVEN_REPO
-ARG MAVEN_TAG
-ARG GRADLE_REPO
-ARG GRADLE_TAG
-ARG NODE_REPO
-ARG NODE_TAG
-ARG DOCKER_REPO
-ARG DOCKER_TAG
-ARG RUST_REPO
-ARG RUST_TAG
-ARG BASE_REPO
-ARG BASE_TAG
+ARG UV_REPO=astral/uv
+ARG UV_TAG=0.12.0
+ARG GO_REPO=golang
+ARG GO_TAG=1-trixie
+ARG JAVA_REPO=eclipse-temurin
+ARG JAVA_TAG=25-jdk-resolute
+ARG MAVEN_REPO=maven
+ARG MAVEN_TAG=3-eclipse-temurin-25-noble
+ARG GRADLE_REPO=gradle
+ARG GRADLE_TAG=9-jdk25-resolute
+ARG NODE_REPO=node
+ARG NODE_TAG=lts-trixie
+ARG DOCKER_REPO=docker
+ARG DOCKER_TAG=29
+ARG RUST_REPO=rust
+ARG RUST_TAG=1-slim-trixie
+ARG BASE_REPO=nvidia/cuda
+ARG BASE_TAG=13.3.1-cudnn-devel-ubuntu26.04
 #
 # KOTLIN_VERSION/PYTHON_VERSION: setup_jvm.sh and setup_python.sh each guard
 # with `: "${VAR:?...}"` and fail with a clear message if empty.
-ARG KOTLIN_VERSION
-ARG PYTHON_VERSION
+ARG KOTLIN_VERSION=2.3.21
+ARG PYTHON_VERSION=3.14
 #
-# CODEX_VERSION/CLAUDE_CODE_VERSION: leaving these unset does NOT force a
-# value at build time — setup_typescript.sh falls back to "latest" internally
-# (`${CODEX_VERSION:-latest}`) regardless of what these ARGs resolve to.
-ARG CODEX_VERSION
-ARG CLAUDE_CODE_VERSION
+# Pin these to specific releases when a repeatable CLI version is needed.
+ARG CODEX_VERSION=latest
+ARG CLAUDE_CODE_VERSION=latest
+ARG IMAGE_VERSION=202609
 
 FROM ${UV_REPO}:${UV_TAG} AS uv-sdk
 FROM ${GO_REPO}:${GO_TAG} AS go-sdk
@@ -193,6 +189,18 @@ RUN --mount=type=cache,target=/root/.npm \
     rm /tmp/setup_typescript.sh
 RUN node --version && npm --version && tsc --version && codex --version && claude --version
 
+# Runtime installs and AI state live in directories persisted by devbox create.
+# Set the npm prefix only AFTER image tools are installed in /usr/local, so an
+# empty mount cannot hide them. User-installed commands take precedence.
+ENV CLAUDE_CONFIG_DIR="/root/.claude" \
+    NPM_CONFIG_PREFIX="/root/.npm-global" \
+    NPM_CONFIG_USERCONFIG="/root/.npm/npmrc"
+ENV PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+
 # Inject Dockerfile ENV values into SSH/login and interactive Bash shells.
 COPY image/setup_env.sh /tmp/setup_env.sh
 RUN chmod +x /tmp/setup_env.sh && /tmp/setup_env.sh && rm /tmp/setup_env.sh
+
+# Keep build metadata last so changing it preserves the toolchain layer cache.
+ARG IMAGE_VERSION
+LABEL org.opencontainers.image.version="${IMAGE_VERSION}"

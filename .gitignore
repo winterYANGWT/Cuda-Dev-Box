@@ -7,6 +7,3 @@ __pycache__/
 # Editor/OS cruft
 .DS_Store
 *.swp
-
-# Local overrides some people keep alongside docker-bake.hcl
-docker-bake.override.hcl
