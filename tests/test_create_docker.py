@@ -32,6 +32,7 @@ DEFAULT_ANSWERS = {
     "Docker socket": ["n"],
     "kernel development": ["y"],
 }
+HOST_KEY = {".ssh/id_ed25519": "private key\n", ".ssh/id_ed25519.pub": "ssh-ed25519 AAAAhost host\n"}
 
 
 class CreateDockerTests(unittest.TestCase):
@@ -47,7 +48,8 @@ class CreateDockerTests(unittest.TestCase):
 
         def run(command, **kwargs):
             commands.append(command)
-            if command[:2] == fail_command:
+            # A "~/" path in fail_command refers to the fake home.
+            if fail_command and command[:2] == [expand(part) for part in fail_command]:
                 raise subprocess.CalledProcessError(1, command)
             if command[:3] == ["docker", "image", "ls"]:
                 return subprocess.CompletedProcess(command, 0, stdout=image_tags)
@@ -76,6 +78,7 @@ class CreateDockerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             mount_root = home / "docker_mount/test-dev"
+            self.home = home
             self.mount_root = str(mount_root)
             for relative, content in (persistent_files or {}).items():
                 path = mount_root / relative
@@ -97,6 +100,7 @@ class CreateDockerTests(unittest.TestCase):
                 )
                 existing_ssh = home / "docker_mount/test-dev/.ssh"
                 existing_ssh.mkdir(parents=True)
+                # Left by an earlier box; recreation replaces it with the host's keys.
                 (existing_ssh / "authorized_keys").write_text("ssh-ed25519 AAAAremote remote\n")
             for relative, content in (home_files or {}).items():
                 path = home / relative
@@ -110,7 +114,7 @@ class CreateDockerTests(unittest.TestCase):
 
             with (
                 patch("builtins.input", side_effect=reply),
-                patch("builtins.print"),
+                patch("builtins.print") as printed,
                 patch("sys.stderr", new_callable=io.StringIO),
                 patch("os.path.expanduser", side_effect=expand),
                 patch("os.path.exists", side_effect=lambda path: True if path == "/dev/nvidiactl" else path_exists(path)),
@@ -126,6 +130,7 @@ class CreateDockerTests(unittest.TestCase):
                         DEVBOX_MAIN(["create"])
                 else:
                     self.assertEqual(DEVBOX_MAIN(["create"]), 0)
+            self.output = "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
             keys_path = mount_root / ".ssh/authorized_keys"
             self.written_keys = keys_path.read_text() if keys_path.exists() else None
             self.agent_unit = unit_path.read_text() if unit_path.exists() else None
@@ -150,6 +155,9 @@ class CreateDockerTests(unittest.TestCase):
 
     def port_bindings(self, create):
         return [create[i + 1] for i, value in enumerate(create) if value == "-p"]
+
+    def key_loads(self, commands):
+        return [command for command in commands if command[0] == "ssh-add" and command[1:] != ["-l"]]
 
     def test_creation_uses_profile_and_all_ports_without_ssh_collision(self):
         create = self.created(self.run_creation())
@@ -189,6 +197,12 @@ class CreateDockerTests(unittest.TestCase):
                 create = self.created(self.run_creation(failing, persistent_files=files))
                 self.assertIn(f"{self.mount_root}/.codex:/root/.codex", create)
                 self.assertEqual(self.persistent_files, files)
+
+    def test_recreation_keeps_private_keys_generated_in_the_box(self):
+        # The host never copies private keys in, so these were made inside the box.
+        box_keys = {".ssh/id_ed25519": "deploy key\n", ".ssh/id_rsa": "rsa key\n", ".ssh/id_ecdsa": "ecdsa key\n"}
+        self.run_creation(persistent_files=box_keys)
+        self.assertEqual(self.persistent_files, box_keys)
 
     def test_image_defaults_to_latest_even_with_older_monthly_builds(self):
         self.assertIn("cuda-devbox:latest", self.created(self.run_creation()))
@@ -288,32 +302,57 @@ class CreateDockerTests(unittest.TestCase):
         self.assertFalse(any("GPU" in prompt for prompt in self.prompts))
 
     def test_forwarding_installs_agent_and_loads_keys_into_its_socket(self):
-        commands = self.run_creation(answers={"SSH agent": ["y"]}, agent_states=(2, 1))
+        commands = self.run_creation(answers={"SSH agent": ["y"]}, agent_states=(2, 1), home_files=HOST_KEY)
         self.assertIn(["systemctl", "--user", "enable", "--now", "docker-ssh-agent.service"], commands)
         self.assertIn("ExecStart=/usr/bin/ssh-agent -D -a", self.agent_unit)
-        self.assertIn(["ssh-add"], commands)
-        self.assertLess(commands.index(["ssh-add"]), commands.index(self.created(commands)))
+        load = ["ssh-add", str(self.home / ".ssh/id_ed25519")]
+        self.assertEqual(self.key_loads(commands), [load])
+        self.assertLess(commands.index(load), commands.index(self.created(commands)))
         self.assertTrue(all(env["SSH_AUTH_SOCK"] == self.agent_socket for env in self.agent_environments))
         self.assertIn("SSH_AUTH_SOCK=/ssh-agent/docker-agent.sock", self.created(commands))
 
+    def test_forwarding_loads_every_host_key_ed25519_first(self):
+        files = {}
+        for name, key_type in (("id_rsa", "ssh-rsa"), ("id_ecdsa", "ecdsa-sha2-nistp256"),
+                               ("id_ed25519_sk", "sk-ssh-ed25519@openssh.com"), ("id_ed25519", "ssh-ed25519"),
+                               ("github", "ssh-ed25519"), ("old_dsa", "ssh-dss")):
+            files[f".ssh/{name}"] = "private key\n"
+            files[f".ssh/{name}.pub"] = f"{key_type} AAAA{name} {name}\n"
+        # Neither a public key without its private key nor a certificate is a key to load.
+        files[".ssh/laptop.pub"] = "ssh-ed25519 AAAAlaptop laptop\n"
+        files[".ssh/id_ed25519-cert.pub"] = "ssh-ed25519-cert-v01@openssh.com AAAAcert id_ed25519\n"
+        commands = self.run_creation(answers={"SSH agent": ["y"]}, home_files=files)
+        # Ed25519 (by name), then ECDSA, then RSA; OpenSSH 10 cannot load DSA.
+        expected = ("github", "id_ed25519", "id_ed25519_sk", "id_ecdsa", "id_rsa")
+        self.assertEqual(self.key_loads(commands), [["ssh-add", *(str(self.home / ".ssh" / name) for name in expected)]])
+
+    def test_forwarding_without_host_private_key_warns_and_still_creates(self):
+        # Only a public key on the host, e.g. the private key stays on a laptop.
+        commands = self.run_creation(answers={"SSH agent": ["y"]},
+                                     home_files={".ssh/laptop.pub": "ssh-ed25519 AAAAlaptop laptop\n"})
+        self.assertEqual(self.key_loads(commands), [])
+        self.assertIn(f"SSH_AUTH_SOCK={self.agent_socket} ssh-add <key>", self.output)
+        self.assertIn("SSH_AUTH_SOCK=/ssh-agent/docker-agent.sock", self.created(commands))
+
     def test_forwarding_reuses_loaded_agent_without_reinstalling_or_readding_keys(self):
-        commands = self.run_creation(answers={"SSH agent": ["y"]}, agent_installed=True, agent_states=(0,))
+        commands = self.run_creation(answers={"SSH agent": ["y"]}, agent_installed=True, agent_states=(0,),
+                                     home_files=HOST_KEY)
         self.assertEqual(self.agent_unit, "existing unit\n")
         self.assertFalse(any(command[0] == "systemctl" for command in commands))
-        self.assertNotIn(["ssh-add"], commands)
+        self.assertEqual(self.key_loads(commands), [])
         self.assertIn("SSH_AUTH_SOCK=/ssh-agent/docker-agent.sock", self.created(commands))
 
     def test_forwarding_starts_stopped_agent_and_waits_until_it_can_load_keys(self):
         commands = self.run_creation(answers={"SSH agent": ["y"]}, agent_installed=True,
-                                     agent_states=(2, 2, 1))
+                                     agent_states=(2, 2, 1), home_files=HOST_KEY)
         self.assertIn(["systemctl", "--user", "start", "docker-ssh-agent.service"], commands)
-        self.assertIn(["ssh-add"], commands)
+        self.assertEqual(self.key_loads(commands), [["ssh-add", str(self.home / ".ssh/id_ed25519")]])
         self.assertEqual(self.agent_unit, "existing unit\n")
 
     def test_forwarding_setup_failure_prevents_container_creation(self):
-        for failing in (["systemctl", "--user"], ["ssh-add"]):
+        for failing in (["systemctl", "--user"], ["ssh-add", "~/.ssh/id_ed25519"]):
             with self.subTest(failing=failing):
-                commands = self.run_creation(failing, answers={"SSH agent": ["y"]})
+                commands = self.run_creation(failing, answers={"SSH agent": ["y"]}, home_files=HOST_KEY)
                 self.assertFalse(any(command[:2] == ["docker", "create"] for command in commands))
 
     def test_unreachable_agent_times_out_before_container_creation(self):
@@ -336,7 +375,7 @@ class CreateDockerTests(unittest.TestCase):
         commands = self.run_creation(["docker", "create"])
         self.assertFalse(any(command[:2] == ["docker", "rm"] for command in commands))
 
-    def test_key_only_preserves_existing_login_and_skips_missing_gitconfig(self):
+    def test_key_only_authorizes_only_host_keys_and_skips_missing_gitconfig(self):
         commands = self.run_creation(answers={"password login": ["y"]}, with_keys=True, gitconfig=False)
         create = self.created(commands)
         self.assertIn("PasswordAuthentication=no", create)
@@ -344,12 +383,15 @@ class CreateDockerTests(unittest.TestCase):
         self.assertIn("PermitRootLogin=prohibit-password", create)
         self.assertFalse(any(command[-1] == "chpasswd" for command in commands))
         self.assertFalse(any(":/root/.gitconfig" in argument for argument in create))
-        self.assertEqual(set(self.written_keys.splitlines()), {"ssh-ed25519 AAAAhost host", "ssh-ed25519 AAAAlaptop laptop", "ssh-ed25519 AAAAremote remote"})
+        self.assertEqual(set(self.written_keys.splitlines()), {"ssh-ed25519 AAAAhost host", "ssh-ed25519 AAAAlaptop laptop"})
 
     def test_key_only_without_public_keys_refuses_to_create_container(self):
-        with self.assertRaisesRegex(SystemExit, "public key"):
-            self.run_creation(answers={"password login": ["y"]})
-        self.assertFalse(any(command[:2] == ["docker", "create"] for command in self.commands))
+        # Keys left in the box's authorized_keys do not count; only the host's do.
+        for box_files in ({}, {".ssh/authorized_keys": "ssh-ed25519 AAAAremote remote\n"}):
+            with self.subTest(box_files=box_files):
+                with self.assertRaisesRegex(SystemExit, "public key"):
+                    self.run_creation(answers={"password login": ["y"]}, persistent_files=box_files)
+                self.assertFalse(any(command[:2] == ["docker", "create"] for command in self.commands))
 
 
 if __name__ == "__main__":

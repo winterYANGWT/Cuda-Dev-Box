@@ -30,6 +30,14 @@ SSH_AGENT_PROXY_PID = "agent-proxy.pid"
 SSH_AGENT_PROXY_LOG = "agent-proxy.log"
 PERSISTENT_SSH_AGENT_SOCKET = "docker-agent.sock"
 PERSISTENT_SSH_AGENT_SERVICE = "docker-ssh-agent.service"
+# Load order for the persistent agent. Containers offer agent keys in this order,
+# so a service such as GitHub sees the Ed25519 key before an older key of the
+# same user. Types not listed (DSA, which OpenSSH 10 cannot load) are skipped.
+AGENT_KEY_TYPES = (
+    ("ssh-ed25519", "sk-ssh-ed25519@openssh.com"),
+    ("ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "sk-ecdsa-sha2-nistp256@openssh.com"),
+    ("ssh-rsa",),
+)
 
 
 # Paths are resolved on each call, not at import, so they follow $HOME.
@@ -85,6 +93,22 @@ WantedBy=default.target
     return 0
 
 
+def host_private_keys():
+    """Private keys in ~/.ssh that have a matching .pub, in AGENT_KEY_TYPES order, then by name."""
+    ssh_dir = os.path.expanduser("~/.ssh")
+    ranked = []
+    for filename in sorted(os.listdir(ssh_dir)) if os.path.isdir(ssh_dir) else ():
+        private_key = os.path.join(ssh_dir, filename.removesuffix(".pub"))
+        if not filename.endswith(".pub") or not os.path.isfile(private_key):
+            continue
+        with open(os.path.join(ssh_dir, filename), "r", encoding="utf-8") as public_key:
+            key_type = next(iter(public_key.read().split()), "")
+        for rank, key_types in enumerate(AGENT_KEY_TYPES):
+            if key_type in key_types:
+                ranked.append((rank, private_key))
+    return [private_key for _, private_key in sorted(ranked)]
+
+
 def ensure_persistent_agent():
     """Install/start the container agent and interactively load keys when empty."""
     agent_sock = os.path.join(persistent_agent_dir(), PERSISTENT_SSH_AGENT_SOCKET)
@@ -114,8 +138,17 @@ def ensure_persistent_agent():
         if status == 0:
             return
         if status == 1:
-            print("Loading default SSH keys into the persistent agent (ssh-add); enter a key passphrase if prompted.")
-            subprocess.run(["ssh-add"], env=agent_env, check=True)
+            # Plain `ssh-add` would load only the default names, RSA first, and
+            # exits 1 without a word when none exist.
+            private_keys = host_private_keys()
+            if not private_keys:
+                print(f"Warning: no private key with a matching .pub in ~/.ssh; the persistent agent stays empty. "
+                      f"Load one later with `SSH_AUTH_SOCK={agent_sock} ssh-add <key>`, or connect to the "
+                      f"container with `ssh -A` if the key is only on another machine.")
+                return
+            names = ", ".join(os.path.basename(private_key) for private_key in private_keys)
+            print(f"Loading {names} into the persistent agent; enter a key passphrase if prompted.")
+            subprocess.run(["ssh-add", *private_keys], env=agent_env, check=True)
             return
         time.sleep(0.1)
     raise SystemExit(
