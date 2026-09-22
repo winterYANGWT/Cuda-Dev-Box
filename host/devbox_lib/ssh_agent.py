@@ -3,10 +3,11 @@
 
 Two ways to reach a host SSH agent from a container:
 
-- Persistent agent (preferred): `devbox agent install` runs ssh-agent as a user
+- Persistent agent: `devbox create` installs it automatically when forwarding
+  is enabled; `devbox agent install` can also install it in advance. It runs as a user
   systemd service on the fixed socket ~/.ssh-agent/docker-agent.sock, which
   survives host reboots and logins.
-- Per-container proxy (fallback): a small relay on
+- Per-container proxy (legacy containers): a small relay on
   ~/docker_mount/<container>/ssh-agent/agent.sock that forwards to whatever
   SSH_AUTH_SOCK was when it started; `devbox agent refresh` restarts it.
 
@@ -82,6 +83,45 @@ WantedBy=default.target
     print("Optional: start this user service at boot before login:")
     print(f"  sudo loginctl enable-linger {os.environ.get('USER', '$USER')}")
     return 0
+
+
+def ensure_persistent_agent():
+    """Install/start the container agent and interactively load keys when empty."""
+    agent_sock = os.path.join(persistent_agent_dir(), PERSISTENT_SSH_AGENT_SOCKET)
+    agent_env = dict(os.environ, SSH_AUTH_SOCK=agent_sock)
+    unit_path = os.path.expanduser(f"~/.config/systemd/user/{PERSISTENT_SSH_AGENT_SERVICE}")
+
+    def key_status():
+        try:
+            return subprocess.run(
+                ["ssh-add", "-l"], env=agent_env, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode
+        except FileNotFoundError:
+            raise SystemExit("ssh-add is not installed; install the host OpenSSH client first.")
+
+    if not os.path.isfile(unit_path):
+        print("Installing the persistent host SSH agent...")
+        install_persistent_agent()
+    elif key_status() not in (0, 1):
+        os.makedirs(persistent_agent_dir(), mode=0o700, exist_ok=True)
+        subprocess.run(["systemctl", "--user", "start", PERSISTENT_SSH_AGENT_SERVICE], check=True)
+
+    # systemctl may return before ssh-agent has opened its socket. ssh-add -l
+    # returns 0 for loaded keys, 1 for no keys, and 2 for an unreachable agent.
+    for _ in range(50):
+        status = key_status()
+        if status == 0:
+            return
+        if status == 1:
+            print("Loading default SSH keys into the persistent agent (ssh-add); enter a key passphrase if prompted.")
+            subprocess.run(["ssh-add"], env=agent_env, check=True)
+            return
+        time.sleep(0.1)
+    raise SystemExit(
+        f"Persistent SSH agent is not ready at {agent_sock}; "
+        f"check `systemctl --user status {PERSISTENT_SSH_AGENT_SERVICE}`."
+    )
 
 
 # --- Per-container proxy ---------------------------------------------------

@@ -19,9 +19,11 @@ PUBLIC_KEY_PREFIXES = (
     "sk-ssh-ed25519@",
     "sk-ecdsa-sha2-",
 )
-# Repository docker-bake.hcl builds (IMAGE_NAME), tagged YYYYMM and latest.
+# Default image repository; builds may be tagged YYYYMM and latest.
 IMAGE_REPOSITORY = "cuda-devbox"
 IMAGE_VERSION_TAG = re.compile(r"\d{6}")
+# Docker's name rule, capped at 63 for the hostname; it also keeps the name one safe path component.
+CONTAINER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}")
 LEGACY_PRIVATE_KEY_NAMES = ("id_ed25519", "id_rsa", "id_ecdsa")
 # The image EXPOSEs 8000-8099; the host side is START..START+99.
 CONTAINER_DEV_PORT_START = 8000
@@ -34,6 +36,8 @@ KERNEL_DEV_BIND_MOUNTS = (
     ("/sys/kernel/debug", "/sys/kernel/debug", "rw"),
     ("/sys/fs/bpf", "/sys/fs/bpf", "rw"),
 )
+# Each directory is isolated by container name and reused on recreation.
+PERSISTENT_TOOL_DIRS = (".codex", ".claude", ".agents", ".npm", ".npm-global")
 
 
 def is_open_ssh_public_key(line):
@@ -143,15 +147,15 @@ def local_image_tags(repository):
 
 
 def prompt_image_tag(repository):
-    """Pick a local build of repository by tag; Enter takes the newest YYYYMM build."""
+    """Pick a local build; prefer latest, then the newest YYYYMM build."""
     tags = local_image_tags(repository)
-    # docker-bake.hcl tags every build YYYYMM (and moves latest); newest first.
+    # Plain docker build updates latest; older dated tags may still be present.
     versions = sorted((tag for tag in tags if IMAGE_VERSION_TAG.fullmatch(tag)), reverse=True)
-    default = versions[0] if versions else "latest" if "latest" in tags else None
+    default = "latest" if "latest" in tags else versions[0] if versions else None
     if default is None:
-        raise SystemExit(f"No local {repository} image found; build one first with `docker buildx bake`.")
+        raise SystemExit(f"No local {repository} image found; build one first with `docker build -t {repository}:latest .`.")
 
-    choices = ", ".join(versions or tags)
+    choices = ", ".join(dict.fromkeys([default, *versions, *tags]))
     while True:
         tag = input(f"Image tag for {repository} ({choices}; default {default}; or a full image name): ").strip() or default
         if tag in tags:
@@ -165,6 +169,35 @@ def prompt_image_tag(repository):
             print(f"Invalid Docker image name: {error}")
             continue
         print(f"No local image {repository}:{tag}. Choose one of: {', '.join(tags)}")
+
+
+def existing_container_names():
+    result = subprocess.run(
+        ["docker", "ps", "--all", "--format", "{{.Names}}"],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    # A container with legacy links lists extra names, comma-separated.
+    return {name for line in result.stdout.split() for name in line.split(",")}
+
+
+def container_name_error(name, existing_names):
+    if not CONTAINER_NAME.fullmatch(name):
+        return "Use 2-63 letters, digits, '_', '.' or '-', starting with a letter or digit."
+    if name in existing_names:
+        return f"Container {name} already exists; remove it first (docker rm -f {name}) or choose another name."
+    return None
+
+
+def prompt_container_name():
+    existing_names = existing_container_names()
+    while True:
+        name = input("Enter the container name: ").strip()
+        error = container_name_error(name, existing_names)
+        if not error:
+            return name
+        print(error)
 
 
 def prompt_memory_profile():
@@ -272,12 +305,39 @@ def nvidia_gpu_unavailable_reason():
     return None
 
 
+def parse_gpu_selection(value):
+    """Normalize GPU indices/ranges to the single CSV field Docker --gpus expects."""
+    value = value.strip().lower() or "all"
+    if value == "all":
+        return value
+
+    devices = {}
+    for item in value.split(","):
+        match = re.fullmatch(r"([0-9]+)(?:\s*-\s*([0-9]+))?", item.strip())
+        if not match:
+            raise ValueError("Use all, comma-separated GPU indices (0,2), or ranges (0-3,5).")
+        start = int(match[1])
+        end = int(match[2]) if match[2] is not None else start
+        if start > end:
+            raise ValueError("GPU ranges must run from the lower index to the higher index (0-3).")
+        for device in range(start, end + 1):
+            devices[device] = None
+
+    # Docker parses this argument as CSV, even when invoked without a shell.
+    return '"device=' + ",".join(str(device) for device in devices) + '"'
+
+
 def prompt_gpu():
     reason = nvidia_gpu_unavailable_reason()
     if reason:
         print(f"Warning: {reason}; creating the container without GPU passthrough.")
-        return False
-    return input("Enable NVIDIA GPU passthrough? (Y/n): ").strip().lower() != "n"
+        return None
+    while True:
+        value = input("NVIDIA GPUs to use (all, 0,2, or 0-3; default all): ")
+        try:
+            return parse_gpu_selection(value)
+        except ValueError as error:
+            print(error)
 
 
 def docker_can_use_nvidia_gpus():
@@ -351,54 +411,20 @@ def warn_kernel_dev_host_state():
 
 
 def add_persistent_ssh_agent_mount(command):
+    ssh_agent.ensure_persistent_agent()
     agent_dir = ssh_agent.persistent_agent_dir()
-    if not os.path.isdir(agent_dir):
-        return False
-
-    persistent_sock = os.path.join(agent_dir, ssh_agent.PERSISTENT_SSH_AGENT_SOCKET)
-    if not os.path.exists(persistent_sock):
-        print(
-            f"Warning: persistent SSH agent socket is not available yet: {persistent_sock}. "
-            "Container will still start; run the user service or ssh-add later."
-        )
-
     command += [
         "-v", f"{agent_dir}:/ssh-agent",
         "-e", f"SSH_AUTH_SOCK=/ssh-agent/{ssh_agent.PERSISTENT_SSH_AGENT_SOCKET}",
     ]
     print(f"Using persistent SSH agent directory: {agent_dir}")
-    return True
-
-
-def add_proxied_ssh_agent_mount(command, container_name):
-    ssh_auth_sock = ssh_agent.host_ssh_auth_sock()
-    if not ssh_auth_sock:
-        print(
-            "Warning: SSH agent forwarding requested, but SSH_AUTH_SOCK is not available; continuing without "
-            "agent forwarding. Run `host/devbox agent install` once to set up a persistent agent."
-        )
-        return False
-
-    agent_dir = ssh_agent.container_agent_dir(container_name)
-    try:
-        proxy_sock = ssh_agent.start_proxy(agent_dir, ssh_auth_sock)
-    except RuntimeError as exc:
-        print(f"Warning: {exc}. Continuing without agent forwarding.")
-        return False
-
-    print(f"Started SSH agent proxy at {proxy_sock}")
-    command += [
-        "-v", f"{agent_dir}:/ssh-agent",
-        "-e", f"SSH_AUTH_SOCK=/ssh-agent/{ssh_agent.SSH_AGENT_PROXY_SOCKET}",
-    ]
-    return True
 
 
 def add_parser(subparsers):
     parser = subparsers.add_parser(
         "create", help="Interactively create an SSH dev container",
         description=f"Interactively create an SSH dev container. Asks for the {IMAGE_REPOSITORY} tag "
-                    "(Enter = newest YYYYMM build), container name, dev-port start, SSH port, login mode, "
+                    "(Enter = latest, or newest YYYYMM build), container name, dev-port start, SSH port, login mode, "
                     "memory profile, GPU, and optional features.",
     )
     parser.set_defaults(func=run)
@@ -406,16 +432,14 @@ def add_parser(subparsers):
 
 def run(args):
     image_name = prompt_image_tag(IMAGE_REPOSITORY)
-
-    # Prompt for container name
-    container_name = input("Enter the container name: ")
+    container_name = prompt_container_name()
 
     # Reserve the complete development range and choose a separate SSH port.
     dev_port_start = prompt_dev_port_start()
     host_port = prompt_ssh_port(dev_port_start)
     key_only = prompt_key_only()
     memory_profile = prompt_memory_profile()
-    enable_gpu = prompt_gpu()
+    gpu_selection = prompt_gpu()
 
     # Prompt for SSH agent forwarding
     forward_ssh_agent = input("Forward host SSH agent into the container? (y/N): ").strip().lower() == "y"
@@ -426,7 +450,13 @@ def run(args):
     ).strip().lower() == "y"
 
     # Reuse the host daemon through its socket; do not start a nested daemon.
-    enable_dind = input("Enable privileged mode and host Docker socket access? (Y/n): ").strip().lower() != "n"
+    if gpu_selection not in (None, "all"):
+        print("Specific GPU selection uses non-privileged mode; privileged mode exposes all host devices.")
+        enable_host_docker = input("Enable host Docker socket access? (Y/n): ").strip().lower() != "n"
+        enable_privileged = False
+    else:
+        enable_host_docker = input("Enable privileged mode and host Docker socket access? (Y/n): ").strip().lower() != "n"
+        enable_privileged = enable_host_docker
 
     # Prompt for host kernel development passthrough. Defaults to enabled for this dev container.
     enable_kernel_dev = input(
@@ -488,10 +518,16 @@ def run(args):
         "-v", f"{vscode_server_dir}:/root/.vscode-server",
         "-v", f"{ssh_dir}:/root/.ssh",
     ]
+    for name in PERSISTENT_TOOL_DIRS:
+        tool_dir = os.path.join(mount_dir, name)
+        # These can contain login tokens. Keep new directories private and
+        # leave existing data and permissions intact when recreating a box.
+        os.makedirs(tool_dir, mode=0o700, exist_ok=True)
+        command += ["-v", f"{tool_dir}:/root/{name}"]
     if os.path.isfile(gitconfig_path):
         command += ["-v", f"{gitconfig_path}:/root/.gitconfig:ro"]
-    if enable_gpu:
-        command += ["--gpus", "all"]
+    if gpu_selection:
+        command += ["--gpus", gpu_selection]
 
     if enable_kernel_dev:
         warn_kernel_dev_host_state()
@@ -505,14 +541,13 @@ def run(args):
         add_optional_dma_heap_devices(command)
         add_optional_device(command, "/dev/udmabuf")
 
-    if forward_ssh_agent and not add_persistent_ssh_agent_mount(command):
-        add_proxied_ssh_agent_mount(command, container_name)
+    if forward_ssh_agent:
+        add_persistent_ssh_agent_mount(command)
 
-    if enable_dind:
-        command += [
-            "--privileged",
-            "-v", "/var/run/docker.sock:/var/run/docker.sock",
-        ]
+    if enable_host_docker:
+        command += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
+    if enable_privileged:
+        command += ["--privileged"]
     else:
         # Cursor/Claude Code and kernel tracing tools use primitives that Docker's
         # default seccomp/AppArmor profiles and dropped capabilities can block.
