@@ -54,7 +54,7 @@ Every host-side task goes through one command, `host/devbox` (`host/devbox --hel
 | Languages | Python / Rust / Go / Java / Kotlin / TypeScript / C/C++ |
 | AI CLIs | Codex CLI / Claude Code CLI, from their official npm packages (native binaries) |
 | Docker | Docker Engine, CLI, Buildx, Compose v2 — connects to the host socket by default |
-| Memory profiles | 16 / 32 / 64 GiB, auto-selects container memory/swap limits |
+| Memory profiles | 8 / 16 / 32 / 64 GiB, auto-selects container memory/swap limits |
 
 ---
 
@@ -161,7 +161,7 @@ Use `host/devbox create` to create a container interactively:
 host/devbox create
 ```
 
-It takes no options; every setting is asked for. For example, for SSH port `61000`, dev ports `62000–62099`, and key-only login, answer the dev-port start with `62000`, the SSH port with `61000`, and the password-login question with `y`.
+It takes no options; every setting is asked for. It needs a native Linux host (WSL isn't supported) with at least 6.625 GiB of usable RAM for the smallest memory profile; otherwise it exits before the first question. For example, for SSH port `61000`, dev ports `62000–62099`, and key-only login, answer the dev-port start with `62000`, the SSH port with `61000`, and the password-login question with `y`.
 
 Press Enter at the image-tag prompt to take `cuda-devbox:latest` (or the newest local `cuda-devbox:YYYYMM` build if `latest` is absent). You can also type another tag such as `202608`, or a full image name such as `other/image:1.0`. For a plain container, answer `n` to the SSH agent, sandbox compatibility, privileged mode, and kernel passthrough prompts. The dev ports are always 100 consecutive host ports starting at the start port, mapped onto container `8000-8099`: start `62000` gives host `62000-62099` (host `62080` reaches a service on container port `8080`). The SSH port can't fall inside that host range. Key-only login disables password login and requires a public key. The GPU question is only asked when Docker can actually use the GPU; otherwise the script warns and leaves the GPU out. The container's `authorized_keys` gets the host's own `~/.ssh/*.pub` plus every key in the host's `~/.ssh/authorized_keys` (so a laptop that can SSH into the host can SSH into the container too; lines with options such as `from=` are skipped). The host is the only source: every create rewrites the file, so recreating a container drops keys that are no longer on the host and keys added inside the container. Private keys in the container's `.ssh` are left alone. The `~/.gitconfig` mount is skipped if the host doesn't have one.
 
@@ -175,7 +175,7 @@ Enter the container name:           # e.g. my-dev; re-asked if invalid or alread
 Host start port for the 100 dev ports mapped to container 8000-8099 (default 8000):   # 62000 -> 62000-62099
 Enter the host port to map to container's port 22 (default 2222):    # must not overlap the dev-port range
 Disable password login and allow SSH public keys only? (y/N):
-Host RAM profile (auto/16/32/64, default auto):       # pick based on actually-available memory
+Host RAM profile (auto/8/16/32/64, default auto):     # Enter = the largest profile that fits usable memory
 NVIDIA GPUs to use (all, 0,2, or 0-3; default all):   # Enter = all; only asked when Docker can use the GPU
 Forward host SSH agent into the container? (y/N):
 Enable Cursor/Claude terminal sandbox compatibility? (adds SYS_ADMIN/NET_ADMIN and unconfined seccomp/AppArmor) (y/N):
@@ -306,17 +306,18 @@ ls -ld /dev/hugepages /sys/kernel/tracing /sys/kernel/debug /sys/fs/bpf /dev/dma
 ls -l /dev/dma_heap 2>/dev/null
 ```
 
-### 16 / 32 / 64 GiB memory profiles
+### 8 / 16 / 32 / 64 GiB memory profiles
 
 `PROFILES` in `host/devbox_lib/memory.py` is the single source for both container limits and host reservation parameters:
 
 | Physical RAM profile | Container RAM limit | Container swap limit | Docker `--memory-swap` total | HugeTLB reservation (2 MiB pages) | CMA |
 | --- | --- | --- | --- | --- | --- |
+| 8 GiB | 4 GiB | 2 GiB | 6 GiB | 256 pages / 512 MiB | 128 MiB |
 | 16 GiB | 10 GiB | 2 GiB | 12 GiB | 512 pages / 1 GiB | 256 MiB |
 | 32 GiB | 22 GiB | 4 GiB | 26 GiB | 1024 pages / 2 GiB | 512 MiB |
 | 64 GiB | 48 GiB | 4 GiB | 52 GiB | 2048 pages / 4 GiB | 1024 MiB |
 
-These defaults leave headroom for the host and the hugepage reservation; they're not tuned to be optimal for every workload. `auto` accounts for firmware and similar reductions in usable memory; it refuses a larger profile than the host can actually support. After a RAM upgrade, reapply the host profile and recreate containers — existing containers don't change their limits automatically.
+These defaults leave headroom for the host and the hugepage reservation; they're not tuned to be optimal for every workload. A profile fits when the host's usable RAM (`MemTotal`) covers its container RAM limit, both reservations, and 2 GiB for the host: 6.625 GiB for 8, 13.25 GiB for 16, 26.5 GiB for 32, and 55 GiB for 64. `auto` takes the largest profile that fits, so firmware or an integrated-GPU carve-out can move a host down a profile, and a profile that doesn't fit is refused. After a RAM upgrade, reapply the host profile and recreate containers — existing containers don't change their limits automatically.
 
 `--memory-swap` is the RAM+swap total. There's no `--memory-swappiness` here (unsupported on cgroup v2); instead the host's `vm.swappiness` is set to `10`. The host's existing ~4 GiB `/swap.img` is left alone, never rebuilt or cleared; container parameters don't add host swap out of nothing either. Multiple containers share whatever memory, swap, and hugepage pool is actually available — the table isn't a per-container guarantee. See [Docker memory limits](https://docs.docker.com/engine/containers/resource_constraints/).
 
@@ -484,7 +485,7 @@ Cuda-Dev-Box/
 │   ├── devbox                # the one entry point: devbox create | memory | agent install | agent refresh
 │   └── devbox_lib/           # modules behind it (not run directly)
 │       ├── container.py      # `devbox create`: interactive container creation
-│       ├── memory.py         # `devbox memory` + the 16/32/64 GiB profiles `devbox create` also uses
+│       ├── memory.py         # `devbox memory` + the 8/16/32/64 GiB profiles `devbox create` also uses
 │       └── ssh_agent.py      # `devbox agent`: persistent agent install, per-container proxy
 ├── docs/
 │   └── DOCKERFILE_REVIEW.md  # Dockerfile design/decision notes
