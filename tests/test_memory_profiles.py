@@ -16,8 +16,10 @@ class MemoryConfigurationTests(unittest.TestCase):
         # Profiles and host settings live in the same module.
         cls.profiles = cls.host = importlib.import_module("devbox_lib.memory")
 
-    def test_auto_profile_uses_usable_ram_with_hardware_reservations(self):
-        for usable_gib, expected in ((14.3, "16"), (30, "32"), (62, "64")):
+    def test_auto_takes_the_largest_profile_that_fits_usable_ram(self):
+        # Needed: 8 -> 6.625, 16 -> 13.25, 32 -> 26.5, 64 -> 55 GiB, so a 16 GiB
+        # host with a large integrated-GPU carve-out (13.2) gets 8.
+        for usable_gib, expected in ((6.7, "8"), (13.2, "8"), (13.3, "16"), (14.3, "16"), (27, "32"), (62, "64")):
             with self.subTest(usable_gib=usable_gib):
                 profile = self.profiles.select_profile("auto", int(usable_gib * 1024**2))
                 self.assertEqual(profile.name, expected)
@@ -27,11 +29,12 @@ class MemoryConfigurationTests(unittest.TestCase):
             self.profiles.select_profile("64", 14991536)
 
     def test_low_memory_host_is_rejected_instead_of_overcommitted(self):
-        with self.assertRaisesRegex(ValueError, "RAM"):
-            self.profiles.select_profile("auto", 8 * 1024**2)
+        with self.assertRaisesRegex(ValueError, r"smallest \(8 GiB\) profile needs at least 6\.625 GiB"):
+            self.profiles.select_profile("auto", 6 * 1024**2)
 
     def test_docker_swap_flag_is_ram_plus_swap_not_swap_alone(self):
         for name, ram, expected in (
+            ("8", 8, ["--memory", "4g", "--memory-swap", "6g"]),
             ("16", 16, ["--memory", "10g", "--memory-swap", "12g"]),
             ("32", 32, ["--memory", "22g", "--memory-swap", "26g"]),
             ("64", 64, ["--memory", "48g", "--memory-swap", "52g"]),

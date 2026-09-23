@@ -26,12 +26,18 @@ class MemoryProfile:
             "--memory-swap", f"{self.memory_gib + self.swap_gib}g",
         ]
 
+    def minimum_mib(self):
+        """Usable RAM the host needs: the container limit, both reservations, and 2 GiB for the host."""
+        return self.memory_gib * 1024 + self.hugepages * 2 + self.cma_mib + 2 * 1024
+
 
 PROFILES = {
+    "8": MemoryProfile("8", 4, 2, 256, 128),
     "16": MemoryProfile("16", 10, 2, 512, 256),
     "32": MemoryProfile("32", 22, 4, 1024, 512),
     "64": MemoryProfile("64", 48, 4, 2048, 1024),
 }
+PROFILE_CHOICES = ("auto", *PROFILES)
 
 
 def read_memtotal_kib():
@@ -42,15 +48,22 @@ def read_memtotal_kib():
 
 
 def select_profile(name, memtotal_kib):
+    usable_gib = memtotal_kib / 1024**2
     if name == "auto":
-        # MemTotal excludes firmware and other hardware/kernel reservations.
-        name = "64" if memtotal_kib >= 56 * 1024**2 else "32" if memtotal_kib >= 28 * 1024**2 else "16"
+        # MemTotal already excludes firmware, integrated-GPU and kernel reservations,
+        # so take the largest profile that fits instead of guessing the RAM size.
+        fitting = [profile for profile in PROFILES.values() if memtotal_kib >= profile.minimum_mib() * 1024]
+        if not fitting:
+            smallest = min(PROFILES.values(), key=MemoryProfile.minimum_mib)
+            raise ValueError(f"This host has {usable_gib:.2f} GiB usable RAM; even the smallest ({smallest.name} GiB) "
+                             f"profile needs at least {smallest.minimum_mib() / 1024:g} GiB")
+        return max(fitting, key=MemoryProfile.minimum_mib)
     if name not in PROFILES:
-        raise ValueError("Choose a RAM profile: auto, 16, 32, or 64")
+        raise ValueError(f"Choose a RAM profile: {', '.join(PROFILE_CHOICES)}")
     profile = PROFILES[name]
-    minimum_mib = profile.memory_gib * 1024 + profile.hugepages * 2 + profile.cma_mib + 2 * 1024
-    if memtotal_kib < minimum_mib * 1024:
-        raise ValueError(f"The {name} GiB profile needs at least {minimum_mib / 1024:g} GiB usable RAM; upgrade RAM before selecting it")
+    if memtotal_kib < profile.minimum_mib() * 1024:
+        raise ValueError(f"The {name} GiB profile needs at least {profile.minimum_mib() / 1024:g} GiB usable RAM; "
+                         f"this host has {usable_gib:.2f} GiB")
     return profile
 
 
@@ -184,7 +197,7 @@ def add_parser(subparsers):
         description="Preview, export, or install Ubuntu host memory settings for the next boot. "
                     "Preview only unless --apply or --output-dir is given.",
     )
-    parser.add_argument("--profile", choices=("auto", "16", "32", "64"), default="auto")
+    parser.add_argument("--profile", choices=PROFILE_CHOICES, default="auto")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--apply", action="store_true", help="install host settings and run update-grub; does not reboot")
     action.add_argument("--output-dir", type=Path, help="export configuration under this directory without applying it")
