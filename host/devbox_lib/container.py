@@ -29,6 +29,8 @@ CONTAINER_DEV_PORT_START = 8000
 CONTAINER_DEV_PORT_COUNT = 100
 # Where `nvidia-ctk cdi generate` writes GPU specs Docker can use for --gpus.
 CDI_SPEC_DIRS = ("/etc/cdi", "/var/run/cdi")
+# WSL kernels report a release such as 6.6.87.2-microsoft-standard-WSL2.
+OSRELEASE_PATH = "/proc/sys/kernel/osrelease"
 KERNEL_DEV_BIND_MOUNTS = (
     ("/dev/hugepages", "/dev/hugepages", "rw"),
     ("/sys/kernel/tracing", "/sys/kernel/tracing", "rw"),
@@ -189,10 +191,17 @@ def prompt_container_name():
         print(error)
 
 
-def prompt_memory_profile():
-    memtotal_kib = memory.read_memtotal_kib()
+def running_under_wsl():
+    try:
+        with open(OSRELEASE_PATH, "r", encoding="utf-8") as osrelease:
+            return "microsoft" in osrelease.read().lower()
+    except OSError:
+        return False
+
+
+def prompt_memory_profile(memtotal_kib):
     while True:
-        name = input("Host RAM profile (auto/16/32/64, default auto): ").strip() or "auto"
+        name = input(f"Host RAM profile ({'/'.join(memory.PROFILE_CHOICES)}, default auto): ").strip() or "auto"
         try:
             profile = memory.select_profile(name, memtotal_kib)
         except ValueError as error:
@@ -272,7 +281,7 @@ def add_optional_device(command, device_path):
 
 def nvidia_gpu_unavailable_reason():
     """Why the container cannot get the NVIDIA GPU, or None when `--gpus all` will work."""
-    if not (os.path.exists("/dev/nvidiactl") or os.path.exists("/dev/dxg")):
+    if not os.path.exists("/dev/nvidiactl"):
         return "no NVIDIA GPU device is available"
 
     try:
@@ -420,6 +429,15 @@ def add_parser(subparsers):
 
 
 def run(args):
+    # Refuse hosts that cannot run a box before asking anything.
+    if running_under_wsl():
+        raise SystemExit("WSL is not supported; run devbox create on a native Linux host.")
+    try:
+        memtotal_kib = memory.read_memtotal_kib()
+        memory.select_profile("auto", memtotal_kib)
+    except ValueError as error:
+        raise SystemExit(str(error))
+
     image_name = prompt_image_tag(IMAGE_REPOSITORY)
     container_name = prompt_container_name()
 
@@ -427,7 +445,7 @@ def run(args):
     dev_port_start = prompt_dev_port_start()
     host_port = prompt_ssh_port(dev_port_start)
     key_only = prompt_key_only()
-    memory_profile = prompt_memory_profile()
+    memory_profile = prompt_memory_profile(memtotal_kib)
     gpu_selection = prompt_gpu()
 
     # Prompt for SSH agent forwarding

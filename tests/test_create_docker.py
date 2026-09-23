@@ -39,7 +39,8 @@ class CreateDockerTests(unittest.TestCase):
     def run_creation(self, fail_command=None, *, answers=None, with_keys=False, gitconfig=True,
                      gpu_toolkit=True, agent_installed=False, agent_states=(1,),
                      image_tags="latest\n202608\n202609\n<none>\n", persistent_files=None,
-                     existing_containers="", home_files=None):
+                     existing_containers="", home_files=None, memtotal_kib=14991536,
+                     osrelease="7.0.0-31-generic\n"):
         commands = []
         self.commands = commands
         self.prompts = prompts = []
@@ -106,6 +107,8 @@ class CreateDockerTests(unittest.TestCase):
                 path = home / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content)
+            osrelease_path = home / "osrelease"
+            osrelease_path.write_text(osrelease)
             expanduser = os.path.expanduser
             path_exists = os.path.exists
 
@@ -123,7 +126,8 @@ class CreateDockerTests(unittest.TestCase):
                 patch("time.sleep"),
                 patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if gpu_toolkit else None),
                 patch("devbox_lib.container.CDI_SPEC_DIRS", ()),
-                patch("devbox_lib.memory.read_memtotal_kib", return_value=14991536),
+                patch("devbox_lib.container.OSRELEASE_PATH", str(osrelease_path)),
+                patch("devbox_lib.memory.read_memtotal_kib", return_value=memtotal_kib),
             ):
                 if fail_command:
                     with self.assertRaises(subprocess.CalledProcessError):
@@ -167,6 +171,25 @@ class CreateDockerTests(unittest.TestCase):
         self.assertIn("memlock=-1:-1", create)
         self.assertIn("--ipc=host", create)
         self.assertNotIn("--memory-swappiness", create)  # unsupported on cgroup v2
+
+    def test_small_host_defaults_to_the_8_gib_profile(self):
+        # A 16 GiB laptop with a large integrated-GPU carve-out: 16 no longer fits and is re-asked.
+        create = self.created(self.run_creation(memtotal_kib=12 * 1024**2, answers={"RAM profile": ["16", ""]}))
+        self.assertEqual(create[create.index("--memory") + 1], "4g")
+        self.assertEqual(create[create.index("--memory-swap") + 1], "6g")
+        profile_prompts = [prompt for prompt in self.prompts if "RAM profile" in prompt]
+        self.assertEqual(len(profile_prompts), 2)
+        self.assertIn("auto/8/16/32/64", profile_prompts[0])
+
+    def test_host_too_small_for_any_profile_exits_before_any_question(self):
+        with self.assertRaisesRegex(SystemExit, "6.625 GiB"):
+            self.run_creation(memtotal_kib=6 * 1024**2)
+        self.assertEqual((self.prompts, self.commands), ([], []))
+
+    def test_wsl_host_is_refused_before_any_question(self):
+        with self.assertRaisesRegex(SystemExit, "WSL"):
+            self.run_creation(osrelease="6.6.87.2-microsoft-standard-WSL2\n")
+        self.assertEqual((self.prompts, self.commands), ([], []))
 
     def test_create_takes_no_command_line_options(self):
         with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
