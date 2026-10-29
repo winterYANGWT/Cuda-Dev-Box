@@ -36,11 +36,11 @@ HOST_KEY = {".ssh/id_ed25519": "private key\n", ".ssh/id_ed25519.pub": "ssh-ed25
 
 
 class CreateDockerTests(unittest.TestCase):
-    def run_creation(self, fail_command=None, *, answers=None, with_keys=False, gitconfig=True,
+    def run_creation(self, fail_command=None, *, interrupt=False, answers=None, with_keys=False, gitconfig=True,
                      gpu_toolkit=True, agent_installed=False, agent_states=(1,),
                      image_tags="latest\n202608\n202609\n<none>\n", persistent_files=None,
                      existing_containers="", home_files=None, memtotal_kib=14991536,
-                     osrelease="7.0.0-31-generic\n"):
+                     osrelease="7.0.0-31-generic\n", missing_programs=()):
         commands = []
         self.commands = commands
         self.prompts = prompts = []
@@ -49,9 +49,11 @@ class CreateDockerTests(unittest.TestCase):
 
         def run(command, **kwargs):
             commands.append(command)
-            # A "~/" path in fail_command refers to the fake home.
+            # A "~/" path in fail_command refers to the fake home; interrupt presses Ctrl-C there instead.
             if fail_command and command[:2] == [expand(part) for part in fail_command]:
-                raise subprocess.CalledProcessError(1, command)
+                raise KeyboardInterrupt if interrupt else subprocess.CalledProcessError(1, command)
+            if command[0] in missing_programs:
+                raise FileNotFoundError(command[0])
             if command[:3] == ["docker", "image", "ls"]:
                 return subprocess.CompletedProcess(command, 0, stdout=image_tags)
             if command[:2] == ["docker", "ps"]:
@@ -130,7 +132,7 @@ class CreateDockerTests(unittest.TestCase):
                 patch("devbox_lib.memory.read_memtotal_kib", return_value=memtotal_kib),
             ):
                 if fail_command:
-                    with self.assertRaises(subprocess.CalledProcessError):
+                    with self.assertRaises(KeyboardInterrupt if interrupt else subprocess.CalledProcessError):
                         DEVBOX_MAIN(["create"])
                 else:
                     self.assertEqual(DEVBOX_MAIN(["create"]), 0)
@@ -141,7 +143,7 @@ class CreateDockerTests(unittest.TestCase):
             self.agent_socket = str(home / ".ssh-agent/docker-agent.sock")
             self.persistent_dirs = {
                 name: (mount_root / name).stat().st_mode & 0o777
-                for name in (".codex", ".claude", ".agents", ".npm", ".npm-global")
+                for name in (".codex", ".claude", ".dsh", ".agents", ".npm", ".npm-global")
                 if (mount_root / name).is_dir()
             }
             self.persistent_files = {
@@ -163,6 +165,9 @@ class CreateDockerTests(unittest.TestCase):
     def key_loads(self, commands):
         return [command for command in commands if command[0] == "ssh-add" and command[1:] != ["-l"]]
 
+    def host_key_generations(self, commands):
+        return [command for command in commands if command[0] == "ssh-keygen"]
+
     def test_creation_uses_profile_and_all_ports_without_ssh_collision(self):
         create = self.created(self.run_creation())
         self.assertEqual(self.port_bindings(create), ["2222:22", "8000-8099:8000-8099/tcp"])
@@ -170,7 +175,18 @@ class CreateDockerTests(unittest.TestCase):
         self.assertEqual(create[create.index("--memory-swap") + 1], "12g")
         self.assertIn("memlock=-1:-1", create)
         self.assertIn("--ipc=host", create)
+        self.assertNotIn("--shm-size", create)  # the host's /dev/shm is used instead
         self.assertNotIn("--memory-swappiness", create)  # unsupported on cgroup v2
+
+    def test_without_kernel_dev_shm_is_half_the_container_ram(self):
+        # Docker's private /dev/shm would otherwise be 64 MiB.
+        for memtotal_gib, profile, shm in ((12, "8", "2048m"), (14.3, "16", "5120m")):
+            with self.subTest(profile=profile):
+                create = self.created(self.run_creation(memtotal_kib=int(memtotal_gib * 1024**2), answers={
+                    "RAM profile": [profile], "kernel development": ["n"],
+                }))
+                self.assertNotIn("--ipc=host", create)
+                self.assertEqual(create[create.index("--shm-size") + 1], shm)
 
     def test_small_host_defaults_to_the_8_gib_profile(self):
         # A 16 GiB laptop with a large integrated-GPU carve-out: 16 no longer fits and is re-asked.
@@ -197,7 +213,7 @@ class CreateDockerTests(unittest.TestCase):
 
     def test_creation_mounts_private_tool_state_and_runtime_npm_directories(self):
         create = self.created(self.run_creation())
-        for name in (".codex", ".claude", ".agents", ".npm", ".npm-global"):
+        for name in (".codex", ".claude", ".dsh", ".agents", ".npm", ".npm-global"):
             with self.subTest(directory=name):
                 self.assertIn(f"{self.mount_root}/{name}:/root/{name}", create)
                 self.assertEqual(self.persistent_dirs[name], 0o700)
@@ -210,6 +226,8 @@ class CreateDockerTests(unittest.TestCase):
             ".codex/auth.json": '{"test": "dummy-token"}\n',
             ".claude/.claude.json": '{"test": "account-state"}\n',
             ".claude/projects/example/session.jsonl": '{"test": "session"}\n',
+            ".dsh/.credentials.yaml": "test: dummy-key\n",
+            ".dsh/profiles/web/cordis.patch.yml": "[]\n",
             ".agents/skills/example/SKILL.md": "example skill\n",
             ".npm/npmrc": "registry=https://registry.npmjs.org/\n",
             ".npm-global/lib/node_modules/example/package.json": '{"name": "example"}\n',
@@ -219,6 +237,7 @@ class CreateDockerTests(unittest.TestCase):
             with self.subTest(failing=failing):
                 create = self.created(self.run_creation(failing, persistent_files=files))
                 self.assertIn(f"{self.mount_root}/.codex:/root/.codex", create)
+                self.assertIn(f"{self.mount_root}/.dsh:/root/.dsh", create)
                 self.assertEqual(self.persistent_files, files)
 
     def test_recreation_keeps_private_keys_generated_in_the_box(self):
@@ -226,6 +245,47 @@ class CreateDockerTests(unittest.TestCase):
         box_keys = {".ssh/id_ed25519": "deploy key\n", ".ssh/id_rsa": "rsa key\n", ".ssh/id_ecdsa": "ecdsa key\n"}
         self.run_creation(persistent_files=box_keys)
         self.assertEqual(self.persistent_files, box_keys)
+
+    def test_first_creation_generates_box_host_keys_and_points_sshd_at_them(self):
+        commands = self.run_creation(answers={"password login": ["y"]}, with_keys=True)
+        key_dir = f"{self.mount_root}/ssh-host-keys"
+        generations = self.host_key_generations(commands)
+        self.assertEqual(
+            [(command[command.index("-t") + 1], command[command.index("-f") + 1], command[command.index("-C") + 1])
+             for command in generations],
+            [(key_type, f"{key_dir}/ssh_host_{key_type}_key", "root@test-dev") for key_type in ("ed25519", "ecdsa", "rsa")],
+        )
+        create = self.created(commands)
+        self.assertLess(commands.index(generations[-1]), commands.index(create))
+        self.assertIn(f"{key_dir}:/etc/ssh/host-keys:ro", create)
+        # Only the mounted keys, so an older image's built-in keys are not used either.
+        daemon_options = create[create.index("cuda-devbox:latest") + 3:]
+        self.assertEqual(
+            [option for option in daemon_options if option.startswith("HostKey=")],
+            [f"HostKey=/etc/ssh/host-keys/ssh_host_{key_type}_key" for key_type in ("ed25519", "ecdsa", "rsa")],
+        )
+        # An image without built-in keys fails a plain `sshd -t`.
+        check = next(command for command in commands if command[-1:] != ["chpasswd"] and "-t" in command
+                     and command[:2] == ["docker", "exec"])
+        self.assertEqual(check[check.index("-t") + 1:], daemon_options)
+        self.assertIn("PasswordAuthentication=no", daemon_options)
+
+    def test_recreation_reuses_the_box_host_keys(self):
+        all_keys = {f"ssh-host-keys/ssh_host_{key_type}_key": f"{key_type} host key\n"
+                    for key_type in ("ed25519", "ecdsa", "rsa")}
+        ed25519_only = {"ssh-host-keys/ssh_host_ed25519_key": "ed25519 host key\n"}
+        for existing, generated in ((all_keys, []), (ed25519_only, ["ecdsa", "rsa"])):
+            with self.subTest(existing=sorted(existing)):
+                commands = self.run_creation(persistent_files=existing)
+                self.assertEqual(
+                    [command[command.index("-t") + 1] for command in self.host_key_generations(commands)], generated,
+                )
+                self.assertEqual(self.persistent_files, existing)
+
+    def test_missing_ssh_keygen_stops_before_container_creation(self):
+        with self.assertRaisesRegex(SystemExit, "ssh-keygen is not installed"):
+            self.run_creation(missing_programs=("ssh-keygen",))
+        self.assertFalse(any(command[:2] == ["docker", "create"] for command in self.commands))
 
     def test_image_defaults_to_latest_even_with_older_monthly_builds(self):
         self.assertIn("cuda-devbox:latest", self.created(self.run_creation()))
@@ -388,11 +448,12 @@ class CreateDockerTests(unittest.TestCase):
         self.assertIsNone(self.agent_unit)
         self.assertFalse(any(command[0] in ("ssh-add", "systemctl") for command in commands))
 
-    def test_port_binding_or_password_failure_removes_only_new_container(self):
+    def test_port_binding_or_password_failure_or_ctrl_c_removes_only_new_container(self):
         for failing in (["docker", "start"], ["docker", "exec"]):
-            with self.subTest(failing=failing):
-                commands = self.run_creation(failing)
-                self.assertIn(["docker", "rm", "-f", "test-container"], commands)
+            for interrupt in (False, True):
+                with self.subTest(failing=failing, interrupt=interrupt):
+                    commands = self.run_creation(failing, interrupt=interrupt)
+                    self.assertIn(["docker", "rm", "-f", "test-container"], commands)
 
     def test_creation_failure_does_not_remove_existing_container(self):
         commands = self.run_creation(["docker", "create"])

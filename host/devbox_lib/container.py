@@ -38,7 +38,12 @@ KERNEL_DEV_BIND_MOUNTS = (
     ("/sys/fs/bpf", "/sys/fs/bpf", "rw"),
 )
 # Each directory is isolated by container name and reused on recreation.
-PERSISTENT_TOOL_DIRS = (".codex", ".claude", ".agents", ".npm", ".npm-global")
+PERSISTENT_TOOL_DIRS = (".codex", ".claude", ".dsh", ".agents", ".npm", ".npm-global")
+# SSH host keys live with the container's state, not in the image, so a box keeps
+# its host identity across recreation and image rebuilds. sshd is pointed at them
+# explicitly, which also overrides the keys baked into older images.
+SSH_HOST_KEY_TYPES = ("ed25519", "ecdsa", "rsa")
+SSH_HOST_KEY_DIR = "/etc/ssh/host-keys"
 
 
 def is_open_ssh_public_key(line):
@@ -85,6 +90,27 @@ def write_authorized_keys(ssh_dir, public_keys):
             authorized_keys.write("\n".join(public_keys) + "\n")
     os.chmod(authorized_keys_path, 0o600)
     return authorized_keys_path
+
+
+def ensure_ssh_host_keys(host_key_dir, container_name):
+    """Generate the host keys this container lacks; existing ones are kept as they are."""
+    os.makedirs(host_key_dir, mode=0o700, exist_ok=True)
+    for key_type in SSH_HOST_KEY_TYPES:
+        key_path = os.path.join(host_key_dir, f"ssh_host_{key_type}_key")
+        if os.path.isfile(key_path):
+            continue
+        try:
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", key_type, "-N", "", "-C", f"root@{container_name}", "-f", key_path],
+                check=True, stdin=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            raise SystemExit("ssh-keygen is not installed; install the host OpenSSH client first.")
+
+
+def sshd_host_key_options():
+    return [option for key_type in SSH_HOST_KEY_TYPES
+            for option in ("-o", f"HostKey={SSH_HOST_KEY_DIR}/ssh_host_{key_type}_key")]
 
 
 def build_root_password():
@@ -498,6 +524,8 @@ def run(args):
         print("Warning: no public keys found in ~/.ssh/*.pub or ~/.ssh/authorized_keys; SSH key login will not be available.")
 
     os.chmod(ssh_dir, 0o700)
+    host_key_dir = os.path.join(mount_dir, "ssh-host-keys")
+    ensure_ssh_host_keys(host_key_dir, container_name)
 
     # Create first so initialization failures can remove only this new container.
     command = [
@@ -513,6 +541,7 @@ def run(args):
         "-v", f"{data_dir}:/root/data",
         "-v", f"{vscode_server_dir}:/root/.vscode-server",
         "-v", f"{ssh_dir}:/root/.ssh",
+        "-v", f"{host_key_dir}:{SSH_HOST_KEY_DIR}:ro",
     ]
     for name in PERSISTENT_TOOL_DIRS:
         tool_dir = os.path.join(mount_dir, name)
@@ -536,6 +565,10 @@ def run(args):
             add_optional_bind_mount(command, host_path, container_path, mode)
         add_optional_dma_heap_devices(command)
         add_optional_device(command, "/dev/udmabuf")
+    else:
+        # Docker's private /dev/shm defaults to 64 MiB: too small for PyTorch
+        # DataLoader workers and NCCL shared-memory transport.
+        command += ["--shm-size", memory_profile.shm_size()]
 
     if forward_ssh_agent:
         add_persistent_ssh_agent_mount(command)
@@ -565,16 +598,18 @@ def run(args):
         for security_opt in security_opts:
             command += ["--security-opt", security_opt]
 
+    sshd_options = sshd_host_key_options()
+    if key_only:
+        sshd_options += ["-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
+                         "-o", "PermitRootLogin=prohibit-password"]
     command += [
         "--entrypoint", "/usr/sbin/sshd",
         "--restart", "unless-stopped",
         image_name,
         "-D",
         "-e",
+        *sshd_options,
     ]
-    if key_only:
-        command += ["-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
-                    "-o", "PermitRootLogin=prohibit-password"]
 
     create_result = subprocess.run(command, check=True, stdout=subprocess.PIPE, text=True)
     container_id = create_result.stdout.strip()
@@ -589,8 +624,10 @@ def run(args):
                 check=True,
                 text=True,
             )
-        subprocess.run(["docker", "exec", container_id, "/usr/sbin/sshd", "-t"], check=True)
-    except (OSError, subprocess.CalledProcessError):
+        # Check with the daemon's own options: images without built-in host keys need them.
+        subprocess.run(["docker", "exec", container_id, "/usr/sbin/sshd", "-t", *sshd_options], check=True)
+    except BaseException:
+        # Includes Ctrl-C, which would otherwise leave a half-initialized box.
         cleanup = subprocess.run(["docker", "rm", "-f", container_id], check=False)
         if cleanup.returncode:
             print(f"Warning: initialization failed and Docker could not remove the new container {container_id}.", file=sys.stderr)
