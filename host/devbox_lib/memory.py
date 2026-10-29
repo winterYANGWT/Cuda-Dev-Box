@@ -26,6 +26,13 @@ class MemoryProfile:
             "--memory-swap", f"{self.memory_gib + self.swap_gib}g",
         ]
 
+    def shm_size(self):
+        """Private /dev/shm cap: half the container RAM, like the kernel's default for tmpfs.
+
+        tmpfs is not preallocated, and what it holds counts against --memory.
+        """
+        return f"{self.memory_gib * 512}m"
+
     def minimum_mib(self):
         """Usable RAM the host needs: the container limit, both reservations, and 2 GiB for the host."""
         return self.memory_gib * 1024 + self.hugepages * 2 + self.cma_mib + 2 * 1024

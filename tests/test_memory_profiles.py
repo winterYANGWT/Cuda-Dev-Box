@@ -43,6 +43,11 @@ class MemoryConfigurationTests(unittest.TestCase):
                 profile = self.profiles.select_profile(name, ram * 1024**2)
                 self.assertEqual(profile.docker_args(), expected)
 
+    def test_private_shm_is_half_the_container_ram(self):
+        for name, shm in (("8", "2048m"), ("16", "5120m"), ("32", "11264m"), ("64", "24576m")):
+            with self.subTest(name=name):
+                self.assertEqual(self.profiles.PROFILES[name].shm_size(), shm)
+
     def test_grub_replaces_old_reservations_and_preserves_other_options(self):
         profile = self.profiles.select_profile("16", 14991536)
         content = self.host.render_configuration(profile, numa_nodes=1)
