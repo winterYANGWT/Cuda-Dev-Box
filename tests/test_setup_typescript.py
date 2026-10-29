@@ -7,6 +7,10 @@ from pathlib import Path
 SETUP = Path(__file__).resolve().parents[1] / "image" / "setup_typescript.sh"
 
 DEV_TOOLS = "npm install -g typescript ts-node yo generator-code eslint @vscode/vsce"
+DEEPSEEK_INSTALL = (
+    "npm install -g --registry=https://registry.npmjs.org"
+    " --allow-scripts=@deepseek-ai/dsh-subprocess-local,node-pty,koffi,protobufjs,@google/genai"
+)
 
 
 class SetupTypescriptTests(unittest.TestCase):
@@ -35,16 +39,21 @@ source "$1"
             DEV_TOOLS,
             "npm install -g --allow-scripts=@anthropic-ai/claude-code"
             " @openai/codex@latest @anthropic-ai/claude-code@latest",
+            DEEPSEEK_INSTALL + " @deepseek-ai/dsh@latest",
         ])
 
     def test_requested_versions_are_passed_to_npm(self):
-        env = {"CODEX_VERSION": "0.155.1", "CLAUDE_CODE_VERSION": "stable"}
+        env = {
+            "CODEX_VERSION": "0.155.1", "CLAUDE_CODE_VERSION": "stable",
+            "DEEPSEEK_HARNESS_VERSION": "0.2.1-rc.2",
+        }
         result, calls = self.run_setup(env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, [
             DEV_TOOLS,
             "npm install -g --allow-scripts=@anthropic-ai/claude-code"
             " @openai/codex@0.155.1 @anthropic-ai/claude-code@stable",
+            DEEPSEEK_INSTALL + " @deepseek-ai/dsh@0.2.1-rc.2",
         ])
 
     def test_failed_npm_call_stops_the_script(self):

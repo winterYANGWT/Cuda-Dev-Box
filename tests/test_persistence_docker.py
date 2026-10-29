@@ -26,7 +26,7 @@ class PersistenceDockerTests(unittest.TestCase):
                 archive.add(package, arcname="package")
 
             mounts = []
-            for name in (".codex", ".claude", ".agents", ".npm", ".npm-global"):
+            for name in (".codex", ".claude", ".dsh", ".agents", ".npm", ".npm-global"):
                 path = root / name
                 path.mkdir(mode=0o700)
                 mounts += ["-v", f"{path}:/root/{name}"]
@@ -50,6 +50,7 @@ npm config set fund false
 test "$(devbox-persistence-smoke)" = PERSIST_OK
 claude mcp add --scope user persistence-smoke -- /bin/echo smoke
 printf 'test-marker\n' > /root/.codex/persistence-marker
+printf 'test-dsh-marker\n' > /root/.dsh/persistence-marker
 mkdir -p /root/.agents/skills/smoke
 printf 'test-skill\n' > /root/.agents/skills/smoke/SKILL.md
 ''')
@@ -59,6 +60,7 @@ printf 'test-skill\n' > /root/.agents/skills/smoke/SKILL.md
 test "$(devbox-persistence-smoke)" = PERSIST_OK
 test "$(npm config get fund)" = false
 test "$(cat /root/.codex/persistence-marker)" = test-marker
+test "$(cat /root/.dsh/persistence-marker)" = test-dsh-marker
 test "$(cat /root/.agents/skills/smoke/SKILL.md)" = test-skill
 node -e 'const c = require("/root/.claude/.claude.json"); if (!c.mcpServers["persistence-smoke"]) process.exit(1)'
 # Model a fresh SSH login that did not inherit Docker ENV.
@@ -72,6 +74,7 @@ env -i HOME=/root PATH=/usr/bin:/bin /bin/bash -elc '
 node --version
 tsc --version
 codex --version
+dsh --version
 claude --version
 python3 --version
 ''')

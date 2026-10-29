@@ -27,3 +27,9 @@ npm install -g \
 npm install -g --allow-scripts=@anthropic-ai/claude-code \
     "@openai/codex@${CODEX_VERSION:-latest}" \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:-latest}"
+
+# DeepSeek Harness's official npm CLI includes the Web UI. Allow the native
+# subprocess/terminal dependencies' install hooks when npm enforces its list.
+npm install -g --registry=https://registry.npmjs.org \
+    --allow-scripts=@deepseek-ai/dsh-subprocess-local,node-pty,koffi,protobufjs,@google/genai \
+    "@deepseek-ai/dsh@${DEEPSEEK_HARNESS_VERSION:-latest}"

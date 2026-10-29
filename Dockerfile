@@ -4,9 +4,10 @@
 # Version defaults live here; override any one with --build-arg NAME=value.
 #
 # ARGs declared here (global scope) are usable in any FROM line below, but
-# NOT automatically inside a stage's RUN/COPY — each stage that needs one
-# re-declares it with a bare `ARG NAME` (no value) to pull it into scope.
-# See the re-declarations at each stage below.
+# NOT automatically inside a stage's RUN/COPY — the final stage re-declares
+# each one it needs with a bare `ARG NAME` (no value) right before the step
+# that uses it. Every RUN after a declaration carries that value in its cache
+# key, so declaring it earlier would rebuild unrelated layers on each change.
 #
 # Base images, repository and tag as separate ARGs.
 ARG UV_REPO=astral/uv
@@ -36,6 +37,7 @@ ARG PYTHON_VERSION=3.14
 # Pin these to specific releases when a repeatable CLI version is needed.
 ARG CODEX_VERSION=latest
 ARG CLAUDE_CODE_VERSION=latest
+ARG DEEPSEEK_HARNESS_VERSION=latest
 ARG IMAGE_VERSION=202609
 
 FROM ${UV_REPO}:${UV_TAG} AS uv-sdk
@@ -48,29 +50,13 @@ FROM ${DOCKER_REPO}:${DOCKER_TAG} AS docker-sdk
 FROM ${RUST_REPO}:${RUST_TAG} AS rust-sdk
 
 FROM ${BASE_REPO}:${BASE_TAG}
-ARG KOTLIN_VERSION
-ARG PYTHON_VERSION
-ARG CODEX_VERSION
-ARG CLAUDE_CODE_VERSION
-
-COPY --from=uv-sdk /uv /uvx /usr/local/bin/
-COPY --from=go-sdk /usr/local/go /usr/local/go
-COPY --from=java-sdk /opt/java/openjdk /opt/java/openjdk
-COPY --from=maven-sdk /usr/share/maven /opt/maven
-COPY --from=gradle-sdk /opt/gradle /opt/gradle
-COPY --from=node-sdk /usr/local/bin/node /usr/local/bin/
-COPY --from=node-sdk /usr/local/lib/node_modules /usr/local/lib/node_modules
-COPY --from=docker-sdk /usr/local/bin/docker /usr/local/bin/dockerd /usr/local/bin/containerd /usr/local/bin/containerd-shim-runc-v2 /usr/local/bin/ctr /usr/local/bin/runc /usr/local/bin/docker-init /usr/local/bin/docker-proxy /usr/local/bin/
-COPY --from=docker-sdk /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
-COPY --from=rust-sdk /usr/local/cargo /usr/local/cargo
-COPY --from=rust-sdk /usr/local/rustup /usr/local/rustup
 
 LABEL maintainer="winteryan"
 LABEL version="26.04"
 LABEL description="This is a Docker image for Ubuntu 26.04"
 
 ENV CUDA_HOME="/usr/local/cuda"
-ENV TZ="Asia/Shanghai" \
+ENV TZ="Asia/Tokyo" \
     LANG="C.UTF-8" \
     LANGUAGE="en_US:en" \
     LC_ALL="C.UTF-8"
@@ -88,7 +74,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime \
     && echo "$TZ" > /etc/timezone
 
-# Install system development packages.
+# Install system development packages. openssh-server's install generates SSH
+# host keys; delete them in this same layer so no layer of the image keeps them.
+# devbox create mounts per-container keys at /etc/ssh/host-keys instead.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && \
@@ -102,13 +90,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
     libsqlite3-dev libncursesw5-dev xz-utils tk-dev \
     libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
-    openssh-server
-
-# Docker CLI/daemon/buildx/compose are copied from the official docker image
-# above (static binaries, no apt install needed) and never started as a
-# daemon during the build; `host/devbox create` normally connects the client to
-# the host's mounted socket.
-RUN docker --version && dockerd --version && docker buildx version && docker compose version
+    openssh-server && \
+    rm -f /etc/ssh/ssh_host_*
 
 # Install locale data so locale variables forwarded from an SSH client
 # (AcceptEnv LANG LC_*) work instead of breaking setlocale()/manpath.
@@ -146,19 +129,32 @@ EXPOSE 22 8000-8099/tcp
 # Set Directory
 RUN mkdir -p /root/data
 
+# Toolchains copied from the official images above. Each COPY --from sits
+# right before the steps that need it, so a new SDK image (a changed *_TAG, or
+# a floating tag moving under --pull) rebuilds only from its own section down
+# and the system layers above stay cached. Go and Docker come last because
+# nothing but their version checks depends on them.
+
 # Rust (rustup, cargo, rustc) is copied from the official rust image above,
 # at that image's own CARGO_HOME/RUSTUP_HOME paths.
 ENV CARGO_HOME="/usr/local/cargo" RUSTUP_HOME="/usr/local/rustup"
 ENV PATH="$CARGO_HOME/bin:${PATH}"
+COPY --from=rust-sdk /usr/local/cargo /usr/local/cargo
+COPY --from=rust-sdk /usr/local/rustup /usr/local/rustup
 COPY image/setup_rust.sh /tmp/setup_rust.sh
 RUN chmod +x /tmp/setup_rust.sh && /tmp/setup_rust.sh && rm /tmp/setup_rust.sh
 
-# Go SDK is copied from the latest stable official Go image.
+# Go SDK is copied from the latest stable official Go image further down; its
+# environment is set here so PATH keeps the same order.
 ENV GOROOT="/usr/local/go"
 ENV PATH="$GOROOT/bin:$PATH"
 
 # Configure the copied JVM development tools.
+COPY --from=java-sdk /opt/java/openjdk /opt/java/openjdk
+COPY --from=maven-sdk /usr/share/maven /opt/maven
+COPY --from=gradle-sdk /opt/gradle /opt/gradle
 COPY image/setup_jvm.sh /tmp/setup_jvm.sh
+ARG KOTLIN_VERSION
 RUN chmod +x /tmp/setup_jvm.sh && \
     KOTLIN_VERSION="${KOTLIN_VERSION}" /tmp/setup_jvm.sh && \
     rm /tmp/setup_jvm.sh
@@ -168,26 +164,47 @@ ENV GRADLE_HOME="/opt/gradle"
 ENV KOTLIN_HOME="/opt/kotlin"
 ENV PATH="$JAVA_HOME/bin:$MAVEN_HOME/bin:$GRADLE_HOME/bin:$KOTLIN_HOME/bin:$PATH"
 
-RUN go version && java --version && javac --version && mvn --version && gradle --version && kotlinc -version
+RUN java --version && javac --version && mvn --version && gradle --version && kotlinc -version
 
 # Install the default Python runtime with uv. Project environments are created later with uv sync.
 ENV PATH="/root/.local/bin:$PATH"
+COPY --from=uv-sdk /uv /uvx /usr/local/bin/
 COPY image/setup_python.sh /tmp/setup_python.sh
+ARG PYTHON_VERSION
 RUN --mount=type=cache,target=/root/.cache/uv \
     chmod +x /tmp/setup_python.sh && \
     PYTHON_VERSION="${PYTHON_VERSION}" /tmp/setup_python.sh && \
     rm /tmp/setup_python.sh
 
 # Node.js/npm are copied from the official Node image; install TypeScript,
-# VS Code extension dev tools, and the Codex/Claude Code CLIs with npm.
+# VS Code extension dev tools, and the Codex/Claude Code/DeepSeek CLIs with npm.
+COPY --from=node-sdk /usr/local/bin/node /usr/local/bin/
+COPY --from=node-sdk /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY image/setup_typescript.sh /tmp/setup_typescript.sh
+ARG CODEX_VERSION
+ARG CLAUDE_CODE_VERSION
+ARG DEEPSEEK_HARNESS_VERSION
 RUN --mount=type=cache,target=/root/.npm \
     chmod +x /tmp/setup_typescript.sh && \
     CODEX_VERSION="${CODEX_VERSION}" \
     CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION}" \
+    DEEPSEEK_HARNESS_VERSION="${DEEPSEEK_HARNESS_VERSION}" \
     /tmp/setup_typescript.sh && \
     rm /tmp/setup_typescript.sh
-RUN node --version && npm --version && tsc --version && codex --version && claude --version
+RUN node --version && npm --version && tsc --version && codex --version && claude --version && dsh --version
+
+COPY --from=go-sdk /usr/local/go /usr/local/go
+RUN go version
+
+# Docker CLI/daemon/buildx/compose are copied from the official docker image
+# above (static binaries, no apt install needed) and never started as a
+# daemon during the build; `host/devbox create` normally connects the client to
+# the host's mounted socket. Newer Docker embeds containerd in dockerd; the
+# wildcard also picks up the standalone containerd binary when an older Docker
+# tag still ships it.
+COPY --from=docker-sdk /usr/local/bin/docker /usr/local/bin/dockerd /usr/local/bin/containerd* /usr/local/bin/ctr /usr/local/bin/runc /usr/local/bin/docker-init /usr/local/bin/docker-proxy /usr/local/bin/
+COPY --from=docker-sdk /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
+RUN docker --version && dockerd --version && docker buildx version && docker compose version
 
 # Runtime installs and AI state live in directories persisted by devbox create.
 # Set the npm prefix only AFTER image tools are installed in /usr/local, so an
