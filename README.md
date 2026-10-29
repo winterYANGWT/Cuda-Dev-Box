@@ -19,8 +19,8 @@ A Docker development container based on NVIDIA CUDA 13.3.1 and Ubuntu 26.04, wit
 ## Quick start
 
 ```bash
-# 1. Build the image
-docker build -t cuda-devbox:latest .
+# 1. Build the image (tagged with the version in VERSION and with latest)
+host/devbox build
 
 # 2. Create a container interactively (recommended)
 host/devbox create
@@ -33,6 +33,7 @@ Every host-side task goes through one command, `host/devbox` (`host/devbox --hel
 
 | Command | What it does |
 | --- | --- |
+| `host/devbox build [--pull] [--no-cache] [--build-arg NAME=VALUE]` | Build the image, tagged with the version in `VERSION` and with `latest` |
 | `host/devbox create` | Interactively create a container (every setting is a prompt) |
 | `host/devbox memory [--profile 16] [--apply]` | Preview, or with `sudo` and `--apply` install, host HugeTLB/CMA/NUMA settings for the next boot |
 | `host/devbox agent install` | One-time: run a persistent host SSH agent for containers |
@@ -50,7 +51,7 @@ Every host-side task goes through one command, `host/devbox` (`host/devbox --hel
 | SSH | Configured; root login by password and/or key |
 | GPU | CUDA 13.3.1 + cuDNN; select all GPUs (default), individual indices, or ranges when Docker GPU support is available |
 | Timezone | Asia/Tokyo |
-| Locale | All UTF-8 locales generated (en_US.UTF-8, zh_CN.UTF-8, ...), default C.UTF-8; SSH forwards and honors the client's locale |
+| Locale | `C.UTF-8` everywhere: `docker exec`, SSH logins, and `ssh <container> <command>` alike. It is UTF-8, so Chinese, Japanese, and other text work; dates, sorting, and messages follow English/POSIX conventions. The SSH client's `LANG`/`LC_*` are not accepted. `en_US.UTF-8` is also generated for programs that ask for it by name |
 | Languages | Python / Rust / Go / Java / Kotlin / TypeScript / C/C++ |
 | AI CLIs | Codex CLI / Claude Code CLI / DeepSeek Harness (`dsh`), from their official npm packages |
 | Docker | Docker Engine, CLI, Buildx, Compose v2 — connects to the host socket by default |
@@ -60,33 +61,23 @@ Every host-side task goes through one command, `host/devbox` (`host/devbox --hel
 
 ## Building the image
 
-From the repository root:
-
 ```bash
-docker build -t cuda-devbox:latest .
+host/devbox build
 ```
 
-Every build argument's default value (base image tags, Python/Kotlin/Codex/Claude Code/DeepSeek Harness versions) lives in the `Dockerfile`. Plain `docker build` works without supplying any build arguments; Docker Bake is not needed for this single-image build.
-
-To keep monthly versions as well as `latest`, set both tags explicitly. Tags are assigned by the build command, not by the Dockerfile. This example uses the build's year and month in Japan time (UTC+9) and stores the same value in the image's `org.opencontainers.image.version` label:
+It builds the repository's `Dockerfile` and tags the image twice: `cuda-devbox:<version>`, with the version read from the `VERSION` file at the repository root, and `cuda-devbox:latest`. The same version goes into the image's `org.opencontainers.image.version` label. A version is `YYYYMM`, or `YYYYMM-N` for another build in the same month (`202610`, `202610-2`, `202610-3`, ...). Set `VERSION` before each build: if `cuda-devbox:<version>` already exists, the command stops and suggests the next version, rather than moving the tag off the older image.
 
 ```bash
-image_version=$(TZ=Asia/Tokyo date +%Y%m)
-docker build --build-arg IMAGE_VERSION="$image_version" \
-    -t "cuda-devbox:$image_version" -t cuda-devbox:latest .
+echo 202611 > VERSION
+host/devbox build
 
-docker images cuda-devbox                  # 202609, 202610, ..., latest
+docker images cuda-devbox                  # 202610, 202610-2, 202611, latest
 docker image inspect cuda-devbox:latest --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
-
-# A second build in the same month would reuse (and move) that month's tag;
-# give it its own instead. Change -t to use another repository name.
-docker build --build-arg IMAGE_VERSION=202609-2 \
-    -t cuda-devbox:202609-2 -t cuda-devbox:latest .
 ```
 
-Changing the tag or label never invalidates the layer cache. Older monthly images stay around until you remove them (`docker rmi cuda-devbox:202608`).
+Changing the version never invalidates the layer cache. Older images stay around until you remove them (`docker rmi cuda-devbox:202608`).
 
-`IMAGE_VERSION` defaults to `202609` in the Dockerfile; pass it explicitly as above for another build date. `docker build .` also works, but omitting `-t` leaves the image untagged, so `devbox create` cannot find it under `cuda-devbox`.
+Every other build argument's default value (base image tags, Python/Kotlin/Codex/Claude Code/DeepSeek Harness versions) lives in the `Dockerfile`. Override one for a single build with `--build-arg NAME=VALUE` (repeatable); `--pull` and `--no-cache` are passed on to `docker build`. A plain `docker build -t cuda-devbox:latest .` still works, but adds no version tag and leaves the version label empty.
 
 ### Build arguments
 
@@ -105,7 +96,7 @@ The build is split into layers. uv, Go, JDK, Maven, Gradle, Node.js, Docker, Rus
 | `image/setup_python.sh` | Installs Python 3.14 via uv; no project dependencies pre-installed |
 | `image/setup_typescript.sh` | npm globals: TypeScript, VS Code extension dev tools, and the Codex/Claude Code/DeepSeek Harness CLIs; Node.js itself is copied from the official image in the Dockerfile |
 
-Codex, Claude Code, and DeepSeek Harness default to whatever is latest at build time; pin versions with `--build-arg CODEX_VERSION=<version>`, `--build-arg CLAUDE_CODE_VERSION=<version-or-stable>`, or `--build-arg DEEPSEEK_HARNESS_VERSION=<version>` (for example, `0.2.1-rc.2`). Docker reuses layer cache; to force a refresh of floating versions, run `docker build --pull --no-cache -t cuda-devbox:latest .`.
+Codex, Claude Code, and DeepSeek Harness default to whatever is latest at build time; pin versions with `--build-arg CODEX_VERSION=<version>`, `--build-arg CLAUDE_CODE_VERSION=<version-or-stable>`, or `--build-arg DEEPSEEK_HARNESS_VERSION=<version>` (for example, `0.2.1-rc.2`). Docker reuses layer cache; to force a refresh of floating versions, run `host/devbox build --pull --no-cache`.
 
 ### Image size and build cache
 
@@ -144,12 +135,12 @@ Overriding a `*_REPO` alone points at a different registry/mirror (e.g. a privat
 For example, to pin a Go minor version, edit `GO_TAG`'s default in the Dockerfile, or override it for one build:
 
 ```bash
-docker build -t cuda-devbox:latest --build-arg GO_TAG=1.26-trixie .
+host/devbox build --build-arg GO_TAG=1.26-trixie
 ```
 
 Setting `BASE_TAG` to `13.3.1-cudnn-runtime-ubuntu26.04` gets a smaller image without `nvcc`/CUDA headers — but that's not a drop-in swap for the C/C++ toolchain this Dockerfile installs. The image is built around a `devel` CUDA base; confirm you don't need to compile CUDA code inside the container before switching to `runtime`.
 
-Floating tags (like `1-trixie`, `lts-trixie`) don't automatically track the newest image on their own; `docker build --pull -t cuda-devbox:latest .` forces a re-pull of whatever the tag currently points at.
+Floating tags (like `1-trixie`, `lts-trixie`) don't automatically track the newest image on their own; `host/devbox build --pull` forces a re-pull of whatever the tag currently points at.
 
 ---
 
@@ -163,7 +154,7 @@ host/devbox create
 
 It takes no options; every setting is asked for. It needs a native Linux host (WSL isn't supported) with at least 6.625 GiB of usable RAM for the smallest memory profile; otherwise it exits before the first question. It also runs the host's `ssh-keygen` (from the OpenSSH client) to make the container's [SSH host keys](#ssh-host-keys). For example, for SSH port `61000`, dev ports `62000–62099`, and key-only login, answer the dev-port start with `62000`, the SSH port with `61000`, and the password-login question with `y`.
 
-Press Enter at the image-tag prompt to take `cuda-devbox:latest` (or the newest local `cuda-devbox:YYYYMM` build if `latest` is absent). You can also type another tag such as `202608`, or a full image name such as `other/image:1.0`. For a plain container, answer `n` to the SSH agent, sandbox compatibility, privileged mode, and kernel passthrough prompts. The dev ports are always 100 consecutive host ports starting at the start port, mapped onto container `8000-8099`: start `62000` gives host `62000-62099` (host `62080` reaches a service on container port `8080`). The SSH port can't fall inside that host range. Key-only login disables password login and requires a public key. The GPU question is only asked when Docker can actually use the GPU; otherwise the script warns and leaves the GPU out. The container's `authorized_keys` gets the host's own `~/.ssh/*.pub` plus every key in the host's `~/.ssh/authorized_keys` (so a laptop that can SSH into the host can SSH into the container too; lines with options such as `from=` are skipped). The host is the only source: every create rewrites the file, so recreating a container drops keys that are no longer on the host and keys added inside the container. Private keys in the container's `.ssh` are left alone. The `~/.gitconfig` mount is skipped if the host doesn't have one.
+Press Enter at the image-tag prompt to take `cuda-devbox:latest` (or the newest local versioned build, such as `cuda-devbox:202610-2`, if `latest` is absent). You can also type another tag such as `202608`, or a full image name such as `other/image:1.0`. For a plain container, answer `n` to the SSH agent, sandbox compatibility, privileged mode, and kernel passthrough prompts. The dev ports are always 100 consecutive host ports starting at the start port, mapped onto container `8000-8099`: start `62000` gives host `62000-62099` (host `62080` reaches a service on container port `8080`). The SSH port can't fall inside that host range. Key-only login disables password login and requires a public key. The GPU question is only asked when Docker can actually use the GPU; otherwise the script warns and leaves the GPU out. The container's `authorized_keys` gets the host's own `~/.ssh/*.pub` plus every key in the host's `~/.ssh/authorized_keys` (so a laptop that can SSH into the host can SSH into the container too; lines with options such as `from=` are skipped). The host is the only source: every create rewrites the file, so recreating a container drops keys that are no longer on the host and keys added inside the container. Private keys in the container's `.ssh` are left alone. The `~/.gitconfig` mount is skipped if the host doesn't have one.
 
 The GPU selection defaults to `all`; enter `0,2` for individual host GPU indices, `0-3` for an inclusive range, or `0,2-4` to combine them. Repeated indices are removed, and malformed inputs are re-asked. For example, `0,2-3` becomes Docker's `--gpus '"device=0,2,3"'`. Use `nvidia-smi -L` on the host to see its GPU indices.
 
@@ -435,7 +426,7 @@ cp -an "$backup_dir/." "$state_dir/"
 printf 'Backup saved to %s\n' "$backup_dir"
 ```
 
-Existing destination files are kept by `cp -an`; if both locations already contain state, review the backup before replacing any destination files. Rebuild the image with `docker build -t cuda-devbox:latest .`, then remove and recreate the container with the same name. Old packages under `/usr/local` were not persisted: use the saved package list to reinstall any extras with `npm install -g <package>@<version>` in the new container. Subsequent global installs and upgrades persist automatically. Files already lost by deleting an unmounted container cannot be recovered by adding a mount later.
+Existing destination files are kept by `cp -an`; if both locations already contain state, review the backup before replacing any destination files. Rebuild the image with `host/devbox build`, then remove and recreate the container with the same name. Old packages under `/usr/local` were not persisted: use the saved package list to reinstall any extras with `npm install -g <package>@<version>` in the new container. Subsequent global installs and upgrades persist automatically. Files already lost by deleting an unmounted container cannot be recovered by adding a mount later.
 
 ---
 
@@ -495,6 +486,7 @@ Cuda-Dev-Box/
 ├── README.md                 # this file
 ├── LICENSE
 ├── Dockerfile                # image build file
+├── VERSION                   # image version for `devbox build`: YYYYMM or YYYYMM-N
 ├── image/                    # setup scripts the Dockerfile copies in and runs (never run by hand)
 │   ├── setup_cpp_libs.sh     # C/C++ library install (incl. GoogleTest)
 │   ├── setup_env.sh          # unified dev-tool shell environment injection
@@ -504,19 +496,22 @@ Cuda-Dev-Box/
 │   ├── setup_ssh.sh          # SSH configuration
 │   └── setup_typescript.sh   # TypeScript, VS Code extension tools, Codex / Claude Code / DeepSeek Harness (npm)
 ├── host/                     # tools you run on the host
-│   ├── devbox                # the one entry point: devbox create | memory | agent install | agent refresh
+│   ├── devbox                # the one entry point: devbox build | create | memory | agent install | agent refresh
 │   └── devbox_lib/           # modules behind it (not run directly)
 │       ├── container.py      # `devbox create`: interactive container creation
+│       ├── image.py          # `devbox build`: build and tag the image from VERSION
 │       ├── memory.py         # `devbox memory` + the 8/16/32/64 GiB profiles `devbox create` also uses
 │       └── ssh_agent.py      # `devbox agent`: persistent agent install, legacy per-container proxy
 ├── docs/
-│   └── DOCKERFILE_REVIEW.md  # Dockerfile design/decision notes
+│   └── ISSUE_MATRIX.md       # review findings and their fixes (in Chinese)
 └── tests/                    # python3 -m unittest discover -s tests
     ├── test_setup_typescript.py
     ├── test_create_docker.py
+    ├── test_devbox_build.py
     ├── test_memory_profiles.py
-    ├── test_persistence_docker.py
-    └── test_ssh_agent.py
+    ├── test_persistence_docker.py   # needs a built image: DEVBOX_TEST_IMAGE=cuda-devbox:latest
+    ├── test_ssh_agent.py
+    └── test_ssh_locale_docker.py    # needs a built image, likewise
 ```
 
 Run `python3 -m unittest discover -s tests` for the host tests. To also verify persistence against a rebuilt image, run:
@@ -578,7 +573,7 @@ CUDA Toolkit and the surrounding environment come from NVIDIA's official `devel`
 | Node.js | LTS | official Node image |
 | TypeScript | latest | npm global |
 
-The JVM toolchain environment is written to `/etc/profile.d/jvm-dev.sh`, and `mvn`, `gradle`, `kotlin`, `kotlinc` are symlinked into `/usr/local/bin`.
+The JVM environment (`JAVA_HOME`, `MAVEN_HOME`, `GRADLE_HOME`, `KOTLIN_HOME`, and their `bin` directories on `PATH`) reaches SSH sessions through `/etc/profile.d/dev-tools.sh`, which `setup_env.sh` writes from the Dockerfile `ENV` values; `mvn`, `gradle`, `kotlin`, `kotlinc` are also symlinked into `/usr/local/bin`.
 
 Rust lives in `CARGO_HOME=/usr/local/cargo` and `RUSTUP_HOME=/usr/local/rustup`, the same paths as the official image. The official image pins its default toolchain to an exact version (for example `1.98.1`) rather than the `stable` channel, so `rustup update` won't move it. Rebuild with a newer `RUST_TAG`, or run `rustup default stable` in the container to track stable (that downloads a full toolchain). rustfmt and clippy are installed; the offline docs (`rust-docs`) aren't.
 
@@ -629,7 +624,7 @@ The two packages are large (roughly 350 MB for Codex and 230 MB for Claude Code,
 The default lives in the Dockerfile's `PYTHON_VERSION` build argument (see [Build arguments](#build-arguments)). Edit it there, or override it for one build:
 
 ```bash
-docker build -t cuda-devbox:latest --build-arg PYTHON_VERSION=3.13 .
+host/devbox build --build-arg PYTHON_VERSION=3.13
 ```
 
 ### Adding a Python package

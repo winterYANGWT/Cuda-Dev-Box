@@ -294,6 +294,14 @@ class CreateDockerTests(unittest.TestCase):
         create = self.created(self.run_creation(image_tags="202608\n202609\n<none>\n"))
         self.assertIn("cuda-devbox:202609", create)
 
+    def test_same_month_rebuilds_are_versions_ordered_by_number(self):
+        # String order would put 202609-10 before 202609-9.
+        for tags, newest in (("202609\n202609-2\n202608-3\n", "202609-2"),
+                             ("202609-9\n202609-10\n202609\n", "202609-10")):
+            with self.subTest(tags=tags):
+                create = self.created(self.run_creation(image_tags=tags))
+                self.assertIn(f"cuda-devbox:{newest}", create)
+
     def test_image_tag_choice_rejects_missing_tags(self):
         create = self.created(self.run_creation(answers={"Image tag": ["201901", "202608"]}))
         self.assertIn("cuda-devbox:202608", create)

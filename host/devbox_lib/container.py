@@ -19,9 +19,10 @@ PUBLIC_KEY_PREFIXES = (
     "sk-ssh-ed25519@",
     "sk-ecdsa-sha2-",
 )
-# Default image repository; builds may be tagged YYYYMM and latest.
+# Default image repository; `devbox build` tags each build with its version and latest.
 IMAGE_REPOSITORY = "cuda-devbox"
-IMAGE_VERSION_TAG = re.compile(r"\d{6}")
+# A version is YYYYMM, then YYYYMM-2, YYYYMM-3, ... for more builds in the same month.
+IMAGE_VERSION_TAG = re.compile(r"\d{6}(?:-\d+)?")
 # Docker's name rule, capped at 63 for the hostname; it also keeps the name one safe path component.
 CONTAINER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}")
 # The image EXPOSEs 8000-8099; the host side is START..START+99.
@@ -163,14 +164,20 @@ def local_image_tags(repository):
     return [tag for tag in dict.fromkeys(result.stdout.split()) if tag != "<none>"]
 
 
+def image_version_key(version):
+    """Sort key for YYYYMM[-N]: numeric, so 202610-10 comes after 202610-9."""
+    month, _, build = version.partition("-")
+    return int(month), int(build or 1)
+
+
 def prompt_image_tag(repository):
-    """Pick a local build; prefer latest, then the newest YYYYMM build."""
+    """Pick a local build; prefer latest, then the newest versioned build."""
     tags = local_image_tags(repository)
-    # Plain docker build updates latest; older dated tags may still be present.
-    versions = sorted((tag for tag in tags if IMAGE_VERSION_TAG.fullmatch(tag)), reverse=True)
+    # devbox build moves latest; older versioned tags may still be present.
+    versions = sorted((tag for tag in tags if IMAGE_VERSION_TAG.fullmatch(tag)), key=image_version_key, reverse=True)
     default = "latest" if "latest" in tags else versions[0] if versions else None
     if default is None:
-        raise SystemExit(f"No local {repository} image found; build one first with `docker build -t {repository}:latest .`.")
+        raise SystemExit(f"No local {repository} image found; build one first with `host/devbox build`.")
 
     choices = ", ".join(dict.fromkeys([default, *versions, *tags]))
     while True:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cuda-Dev-Box host tool.
 
+  devbox build           build the image, tagged with the VERSION file's version and latest
   devbox create          interactively create an SSH dev container
   devbox memory          preview or install host HugeTLB/CMA/NUMA settings
   devbox agent install   install the persistent host SSH agent (one-time)
@@ -16,7 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
-from devbox_lib import container, memory, ssh_agent  # noqa: E402
+from devbox_lib import container, image, memory, ssh_agent  # noqa: E402
 
 
 def main(argv=None):
@@ -24,6 +25,7 @@ def main(argv=None):
         prog="devbox", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    image.add_parser(subparsers)
     container.add_parser(subparsers)
     memory.add_parser(subparsers)
     ssh_agent.add_parser(subparsers)
