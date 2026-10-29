@@ -225,14 +225,22 @@ def host_ssh_auth_sock():
 
 
 def refresh_proxy(args):
+    # `devbox create` no longer makes this directory, so only legacy containers have one.
+    agent_dir = container_agent_dir(args.container)
+    if not os.path.isdir(agent_dir):
+        agent_sock = os.path.join(persistent_agent_dir(), PERSISTENT_SSH_AGENT_SOCKET)
+        print(f"{args.container} has no per-container SSH agent proxy at {agent_dir}. Containers from "
+              f"`devbox create` use the persistent agent; load keys into it with "
+              f"`SSH_AUTH_SOCK={agent_sock} ssh-add <key>`.", file=sys.stderr)
+        return 1
+
     ssh_auth_sock = host_ssh_auth_sock()
     if not ssh_auth_sock:
         print("SSH_AUTH_SOCK is not set in this shell or does not exist.", file=sys.stderr)
         return 1
 
-    listen_sock = start_proxy(container_agent_dir(args.container), ssh_auth_sock)
+    listen_sock = start_proxy(agent_dir, ssh_auth_sock)
     print(f"Refreshed SSH agent proxy: {listen_sock}")
-    print(f"Containers created by `devbox create` use SSH_AUTH_SOCK=/ssh-agent/{SSH_AGENT_PROXY_SOCKET}.")
     return 0
 
 
@@ -328,7 +336,7 @@ def add_parser(subparsers):
     install.set_defaults(func=install_persistent_agent)
 
     refresh = actions.add_parser(
-        "refresh", help="Restart a container's fallback proxy after the host SSH_AUTH_SOCK changed",
+        "refresh", help="Restart a legacy container's per-container proxy after the host SSH_AUTH_SOCK changed",
     )
     refresh.add_argument("container", help="container name")
     refresh.set_defaults(func=refresh_proxy)

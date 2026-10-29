@@ -4,7 +4,7 @@
   devbox create          interactively create an SSH dev container
   devbox memory          preview or install host HugeTLB/CMA/NUMA settings
   devbox agent install   install the persistent host SSH agent (one-time)
-  devbox agent refresh   restart a container's fallback SSH agent proxy
+  devbox agent refresh   restart a legacy container's SSH agent proxy
 
 Run `devbox <command> --help` for each command's options.
 """
