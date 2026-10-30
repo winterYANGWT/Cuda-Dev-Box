@@ -48,6 +48,16 @@ locale -a
         self.assertEqual((setenv["LANG"], setenv["LC_ALL"]), ("C.UTF-8", "C.UTF-8"))
         self.assertEqual(set(locales.split()), {"C", "C.utf8", "POSIX", "en_US.utf8"})
 
+    def test_sshd_accepts_public_keys_only(self):
+        output = self.run_in_image('''
+ssh-keygen -q -t ed25519 -N "" -f /tmp/host_key
+/usr/sbin/sshd -T -o HostKey=/tmp/host_key | grep -E "^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication) "
+''')
+        self.assertEqual(sorted(output.splitlines()), [
+            "kbdinteractiveauthentication no", "passwordauthentication no",
+            "permitrootlogin prohibit-password", "pubkeyauthentication yes",
+        ])
+
     def test_shell_startup_fills_in_missing_values_without_overriding_them(self):
         output = self.run_in_image('''
 PATH=/parent/bin:$PATH CC=parent-cc bash -i -c 'echo "$PATH"; echo "$CC"' 2>/dev/null

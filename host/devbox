@@ -6,6 +6,7 @@
   devbox memory          preview or install host HugeTLB/CMA/NUMA settings
   devbox agent install   install the persistent host SSH agent (one-time)
   devbox agent refresh   restart a legacy container's SSH agent proxy
+  devbox key add         authorize a pasted SSH public key for a container (also: key list, key remove)
 
 Run `devbox <command> --help` for each command's options.
 """
@@ -17,7 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
-from devbox_lib import container, image, memory, ssh_agent  # noqa: E402
+from devbox_lib import container, image, keys, memory, ssh_agent  # noqa: E402
 
 
 def main(argv=None):
@@ -27,6 +28,7 @@ def main(argv=None):
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     image.add_parser(subparsers)
     container.add_parser(subparsers)
+    keys.add_parser(subparsers)
     memory.add_parser(subparsers)
     ssh_agent.add_parser(subparsers)
     args = parser.parse_args(argv)

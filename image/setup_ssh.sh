@@ -13,8 +13,10 @@ set_sshd_option() {
 }
 
 mkdir -p /run/sshd
-set_sshd_option PermitRootLogin yes
-set_sshd_option PasswordAuthentication yes
+# Public keys only: root has no password, and devbox create sets none.
+set_sshd_option PermitRootLogin prohibit-password
+set_sshd_option PasswordAuthentication no
+set_sshd_option KbdInteractiveAuthentication no
 set_sshd_option PubkeyAuthentication yes
 set_sshd_option AuthorizedKeysFile .ssh/authorized_keys
 set_sshd_option StrictModes no

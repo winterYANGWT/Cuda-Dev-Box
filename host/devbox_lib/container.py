@@ -3,10 +3,10 @@
 import argparse
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from . import memory, ssh_agent
 
@@ -38,13 +38,33 @@ KERNEL_DEV_BIND_MOUNTS = (
     ("/sys/kernel/debug", "/sys/kernel/debug", "rw"),
     ("/sys/fs/bpf", "/sys/fs/bpf", "rw"),
 )
-# Each directory is isolated by container name and reused on recreation.
-PERSISTENT_TOOL_DIRS = (".codex", ".claude", ".dsh", ".agents", ".npm", ".npm-global")
+# ~/docker_mount/<name> is the box's /root, so everything kept in the home (tool
+# logins, shell history, caches, runtime installs) survives recreation and image
+# updates. Files devbox keeps for a box live in BOX_STATE_DIR/<name>, which the box
+# never sees.
+BOX_STATE_DIR = "~/docker_mount/.devbox"
+# Set by images that keep nothing they need in /root (see the Dockerfile).
+PERSISTENT_HOME_LABEL = "cuda-devbox.persistent-home"
+# Ubuntu's startup files for root, which the image's own /root holds and the mount hides.
+SEED_HOME_SCRIPT = (
+    'for name in .bashrc .profile; do '
+    '[ -e "/root/$name" ] || cp "/usr/share/base-files/dot$name" "/root/$name"; done'
+)
 # SSH host keys live with the container's state, not in the image, so a box keeps
 # its host identity across recreation and image rebuilds. sshd is pointed at them
 # explicitly, which also overrides the keys baked into older images.
 SSH_HOST_KEY_TYPES = ("ed25519", "ecdsa", "rsa")
 SSH_HOST_KEY_DIR = "/etc/ssh/host-keys"
+# Ports are published on the host's loopback only: a box is reached through its
+# host (from another machine, `ssh -J <host>`), never straight from the network.
+PUBLISH_ADDRESS = "127.0.0.1"
+# Public keys pasted with `devbox key add`, kept with the box's state so recreation keeps them.
+ADDED_KEYS_FILE = "ssh-authorized-keys"
+# Password login is never offered; create sets no root password.
+KEY_ONLY_SSHD_OPTIONS = (
+    "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
+    "-o", "PermitRootLogin=prohibit-password",
+)
 
 
 def is_open_ssh_public_key(line):
@@ -55,42 +75,79 @@ def is_open_ssh_public_key(line):
     return key_type in PUBLIC_KEY_PREFIXES or key_type.startswith(PUBLIC_KEY_PREFIXES)
 
 
-def collect_public_keys(host_ssh_dir):
-    """Host users' own keys (*.pub) plus the keys allowed to log in to the host (authorized_keys).
+def public_keys_in(path):
+    """Plain public keys in one file; lines with options (from=..., command=...) are
+    skipped rather than copied unrestricted."""
+    with open(path, "r", encoding="utf-8") as key_file:
+        return [line.strip() for line in key_file if is_open_ssh_public_key(line)]
 
-    authorized_keys holds the keys of other machines used to reach this host,
-    e.g. a laptop; they get the same access to the container. Lines with
-    options (from=..., command=...) are skipped rather than copied unrestricted.
+
+def key_identity(key):
+    """Type and key data: the same key under another comment is the same key."""
+    return tuple(key.split()[:2])
+
+
+def home_dir(container_name):
+    return os.path.expanduser(f"~/docker_mount/{container_name}")
+
+
+def box_state_path(container_name, name):
+    """A file or directory devbox keeps for the box, outside the box's home.
+
+    Earlier versions kept these in ~/docker_mount/<name>, which is now the home,
+    where the box could change them; they move out on first use.
     """
-    if not os.path.isdir(host_ssh_dir):
-        return []
+    state_dir = os.path.expanduser(f"{BOX_STATE_DIR}/{container_name}")
+    path = os.path.join(state_dir, name)
+    legacy_path = os.path.join(home_dir(container_name), name)
+    if not os.path.lexists(path) and os.path.lexists(legacy_path):
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        os.rename(legacy_path, path)
+    return path
 
-    public_keys = []
+
+def added_keys_path(container_name):
+    return box_state_path(container_name, ADDED_KEYS_FILE)
+
+
+def box_key_sources(container_name):
+    """(key, file) for each key the box authorizes, first file winning for duplicates.
+
+    The host user's own keys (~/.ssh/*.pub), the keys allowed to log in to the host
+    (~/.ssh/authorized_keys, e.g. a laptop's), then the keys added with `devbox key add`.
+    The box's authorized_keys is rewritten from these alone, so a key removed here
+    loses access.
+    """
+    host_ssh_dir = os.path.expanduser("~/.ssh")
+    paths = []
+    if os.path.isdir(host_ssh_dir):
+        paths = [os.path.join(host_ssh_dir, name) for name in sorted(os.listdir(host_ssh_dir))
+                 if name.endswith(".pub") or name == "authorized_keys"]
+    paths.append(added_keys_path(container_name))
+
+    sources = []
     seen = set()
-    for filename in sorted(os.listdir(host_ssh_dir)):
-        if not (filename.endswith(".pub") or filename == "authorized_keys"):
-            continue
-        path = os.path.join(host_ssh_dir, filename)
+    for path in paths:
         if not os.path.isfile(path):
             continue
-        with open(path, "r", encoding="utf-8") as key_file:
-            for line in key_file:
-                key = line.strip()
-                if not key or key.startswith("#") or not is_open_ssh_public_key(key):
-                    continue
-                if key not in seen:
-                    public_keys.append(key)
-                    seen.add(key)
-    return public_keys
+        for key in public_keys_in(path):
+            if key_identity(key) not in seen:
+                sources.append((key, path))
+                seen.add(key_identity(key))
+    return sources
 
 
-def write_authorized_keys(ssh_dir, public_keys):
-    authorized_keys_path = os.path.join(ssh_dir, "authorized_keys")
-    with open(authorized_keys_path, "w", encoding="utf-8") as authorized_keys:
-        if public_keys:
-            authorized_keys.write("\n".join(public_keys) + "\n")
-    os.chmod(authorized_keys_path, 0o600)
-    return authorized_keys_path
+def install_authorized_keys(container, public_keys):
+    """Write the box's authorized_keys through Docker.
+
+    Work inside the box can leave its .ssh directory owned by root on the host,
+    where the host user can no longer write. docker cp reaches it anyway, whether
+    the box is created, running or stopped.
+    """
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="devbox-authorized-keys-") as keys_file:
+        keys_file.write("".join(f"{key}\n" for key in public_keys))
+        keys_file.flush()
+        subprocess.run(["docker", "cp", "-q", keys_file.name, f"{container}:/root/.ssh/authorized_keys"], check=True)
 
 
 def ensure_ssh_host_keys(host_key_dir, container_name):
@@ -112,15 +169,6 @@ def ensure_ssh_host_keys(host_key_dir, container_name):
 def sshd_host_key_options():
     return [option for key_type in SSH_HOST_KEY_TYPES
             for option in ("-o", f"HostKey={SSH_HOST_KEY_DIR}/ssh_host_{key_type}_key")]
-
-
-def build_root_password():
-    env_password = os.environ.get("DOCKER_SSH_ROOT_PASSWORD")
-    if env_password:
-        if "\n" in env_password or "\r" in env_password:
-            raise ValueError("DOCKER_SSH_ROOT_PASSWORD must not contain newline characters")
-        return env_password, False
-    return secrets.token_urlsafe(24), True
 
 
 def docker_image_name_error(image_name):
@@ -193,6 +241,21 @@ def prompt_image_tag(repository):
             print(f"Invalid Docker image name: {error}")
             continue
         print(f"No local image {repository}:{tag}. Choose one of: {', '.join(tags)}")
+
+
+def confirm_persistent_home(image_name):
+    """Older images keep the default Python in /root, where the mounted home hides it."""
+    result = subprocess.run(
+        ["docker", "image", "inspect", "--format", f'{{{{index .Config.Labels "{PERSISTENT_HOME_LABEL}"}}}}', image_name],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip() == "true":
+        return
+    print(f"Warning: {image_name} is not a local image built for a persisted home ({PERSISTENT_HOME_LABEL} label). "
+          "create mounts ~/docker_mount/<container> as /root, which hides anything such an image keeps there, "
+          "such as its default Python. Rebuild the image with `host/devbox build` first.")
+    if input("Continue anyway? (y/N): ").strip().lower() != "y":
+        raise SystemExit("Nothing was created.")
 
 
 def existing_container_names():
@@ -277,7 +340,7 @@ def dev_port_binding(start):
     """Map host START..START+99 onto container 8000-8099."""
     host_start, host_end = dev_port_range(start)
     container_end = CONTAINER_DEV_PORT_START + CONTAINER_DEV_PORT_COUNT - 1
-    return f"{host_start}-{host_end}:{CONTAINER_DEV_PORT_START}-{container_end}/tcp"
+    return f"{PUBLISH_ADDRESS}:{host_start}-{host_end}:{CONTAINER_DEV_PORT_START}-{container_end}/tcp"
 
 
 def prompt_ssh_port(dev_port_start):
@@ -287,10 +350,6 @@ def prompt_ssh_port(dev_port_start):
         if value.isascii() and value.isdecimal() and 1 <= int(value) <= 65535 and not start <= int(value) <= end:
             return str(int(value))
         print(f"Choose a port from 1 to 65535 outside the development range {start}-{end}.")
-
-
-def prompt_key_only():
-    return input("Disable password login and allow SSH public keys only? (y/N): ").strip().lower() == "y"
 
 
 def add_unique(values, value):
@@ -455,7 +514,7 @@ def add_parser(subparsers):
     parser = subparsers.add_parser(
         "create", help="Interactively create an SSH dev container",
         description=f"Interactively create an SSH dev container. Asks for the {IMAGE_REPOSITORY} tag "
-                    "(Enter = latest, or newest YYYYMM build), container name, dev-port start, SSH port, login mode, "
+                    "(Enter = latest, or newest YYYYMM build), container name, dev-port start, SSH port, "
                     "memory profile, GPU, and optional features.",
     )
     parser.set_defaults(func=run)
@@ -472,12 +531,19 @@ def run(args):
         raise SystemExit(str(error))
 
     image_name = prompt_image_tag(IMAGE_REPOSITORY)
+    confirm_persistent_home(image_name)
     container_name = prompt_container_name()
+    # Checked before the other questions: without a key nobody could log in.
+    public_keys = [key for key, _ in box_key_sources(container_name)]
+    if not public_keys:
+        raise SystemExit(
+            "No SSH public key to authorize, and password login is not offered. Add the key of the machine "
+            f"you connect from with `host/devbox key add {container_name}`, then run create again."
+        )
 
     # Reserve the complete development range and choose a separate SSH port.
     dev_port_start = prompt_dev_port_start()
     host_port = prompt_ssh_port(dev_port_start)
-    key_only = prompt_key_only()
     memory_profile = prompt_memory_profile(memtotal_kib)
     gpu_selection = prompt_gpu()
 
@@ -503,35 +569,24 @@ def run(args):
         "Enable host kernel development passthrough for bpftrace/HugeTLB/CMA/NUMA? (Y/n): "
     ).strip().lower() != "n"
 
-    if not key_only:
-        root_password, generated_password = build_root_password()
-
-    # Create the mount directory
-    mount_dir = os.path.expanduser(f"~/docker_mount/{container_name}")
-    data_dir = os.path.expanduser(f"~/docker_mount/{container_name}/data")
-    vscode_server_dir = os.path.expanduser(f"~/docker_mount/{container_name}/.vscode-server")
+    # The box's home. A recreated box gets the same one back; an existing one from
+    # before the whole home was mounted already holds data, .ssh and the tool directories.
+    home = home_dir(container_name)
     gitconfig_path = os.path.expanduser("~/.gitconfig")
-    ssh_dir = os.path.expanduser(f"~/docker_mount/{container_name}/.ssh")
+    ssh_dir = os.path.join(home, ".ssh")
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    # docker cp needs /root/.ssh to exist.
+    for directory in (os.path.join(home, "data"), ssh_dir):
+        os.makedirs(directory, exist_ok=True)
 
-    dir_list = [mount_dir, data_dir, vscode_server_dir, ssh_dir]
-
-    for directory in dir_list:
-        if not os.path.exists(directory):
-            os.makedirs(directory, exist_ok=True)
-
-    host_ssh_dir = os.path.expanduser("~/.ssh")
-    # The host is the only source, so a key revoked there loses access here on recreation.
-    public_keys = collect_public_keys(host_ssh_dir)
-    if key_only and not public_keys:
-        raise SystemExit("SSH key-only mode requires at least one public key in ~/.ssh/*.pub or ~/.ssh/authorized_keys.")
-    authorized_keys_path = write_authorized_keys(ssh_dir, public_keys)
-    if public_keys:
-        print(f"Injected {len(public_keys)} public key(s) into {authorized_keys_path}")
-    else:
-        print("Warning: no public keys found in ~/.ssh/*.pub or ~/.ssh/authorized_keys; SSH key login will not be available.")
-
-    os.chmod(ssh_dir, 0o700)
-    host_key_dir = os.path.join(mount_dir, "ssh-host-keys")
+    # The home holds logins, tokens and shell history.
+    for directory, mode in ((home, 0o700), (ssh_dir, 0o700)):
+        try:
+            os.chmod(directory, mode)
+        except PermissionError:
+            # Work inside the box left it owned by root; authorized_keys goes in through Docker.
+            pass
+    host_key_dir = box_state_path(container_name, "ssh-host-keys")
     ensure_ssh_host_keys(host_key_dir, container_name)
 
     # Create first so initialization failures can remove only this new container.
@@ -539,23 +594,15 @@ def run(args):
         "docker", "create",
         "--name", container_name,
         "--hostname", container_name,
-        "-p", f"{host_port}:22",
+        "-p", f"{PUBLISH_ADDRESS}:{host_port}:22",
         "-p", dev_port_binding(dev_port_start),
     ]
     command += memory_profile.docker_args()
 
     command += [
-        "-v", f"{data_dir}:/root/data",
-        "-v", f"{vscode_server_dir}:/root/.vscode-server",
-        "-v", f"{ssh_dir}:/root/.ssh",
+        "-v", f"{home}:/root",
         "-v", f"{host_key_dir}:{SSH_HOST_KEY_DIR}:ro",
     ]
-    for name in PERSISTENT_TOOL_DIRS:
-        tool_dir = os.path.join(mount_dir, name)
-        # These can contain login tokens. Keep new directories private and
-        # leave existing data and permissions intact when recreating a box.
-        os.makedirs(tool_dir, mode=0o700, exist_ok=True)
-        command += ["-v", f"{tool_dir}:/root/{name}"]
     if os.path.isfile(gitconfig_path):
         command += ["-v", f"{gitconfig_path}:/root/.gitconfig:ro"]
     if gpu_selection:
@@ -605,10 +652,7 @@ def run(args):
         for security_opt in security_opts:
             command += ["--security-opt", security_opt]
 
-    sshd_options = sshd_host_key_options()
-    if key_only:
-        sshd_options += ["-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
-                         "-o", "PermitRootLogin=prohibit-password"]
+    sshd_options = [*sshd_host_key_options(), *KEY_ONLY_SSHD_OPTIONS]
     command += [
         "--entrypoint", "/usr/sbin/sshd",
         "--restart", "unless-stopped",
@@ -623,14 +667,11 @@ def run(args):
     if not container_id:
         raise RuntimeError("Docker create did not return a container ID")
     try:
+        # Before start, so keys left from an earlier box never get a moment of access.
+        install_authorized_keys(container_id, public_keys)
         subprocess.run(["docker", "start", container_id], check=True, stdout=subprocess.PIPE, text=True)
-        if not key_only:
-            subprocess.run(
-                ["docker", "exec", "-i", container_id, "chpasswd"],
-                input=f"root:{root_password}\n",
-                check=True,
-                text=True,
-            )
+        # A new home starts empty; files already there are left as they are.
+        subprocess.run(["docker", "exec", container_id, "/bin/sh", "-c", SEED_HOME_SCRIPT], check=True)
         # Check with the daemon's own options: images without built-in host keys need them.
         subprocess.run(["docker", "exec", container_id, "/usr/sbin/sshd", "-t", *sshd_options], check=True)
     except BaseException:
@@ -640,12 +681,9 @@ def run(args):
             print(f"Warning: initialization failed and Docker could not remove the new container {container_id}.", file=sys.stderr)
         raise
     print(f"Started container: {container_id}")
-
-    if key_only:
-        print("SSH public-key login enabled; password login is disabled.")
-    elif generated_password:
-        print("Generated root SSH password. It is shown once; store it now if you need password login.")
-        print(f"Root SSH password: {root_password}")
-    else:
-        print("Root SSH password was set from DOCKER_SSH_ROOT_PASSWORD and was not displayed.")
+    print(f"Its /root is {home} on the host and survives recreation.")
+    print(f"Authorized {len(public_keys)} SSH public key(s); password login is disabled. "
+          f"Add more with `host/devbox key add {container_name}`.")
+    print(f"SSH is reachable only from this host: ssh -p {host_port} root@{PUBLISH_ADDRESS}. "
+          f"From another machine, jump through this host: ssh -J <this-host> -p {host_port} root@{PUBLISH_ADDRESS}")
     return 0

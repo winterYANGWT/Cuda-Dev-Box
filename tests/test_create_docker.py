@@ -23,7 +23,6 @@ DEFAULT_ANSWERS = {
     "Host start port": [""],
     # The first two fall inside the default dev range 8000-8099 and are re-asked.
     "port 22": ["8000", "8099", "2222"],
-    "password login": ["n"],
     # 64 does not fit the stubbed 14.3 GiB host and is re-asked.
     "RAM profile": ["64", "16"],
     "GPU": [""],
@@ -40,11 +39,13 @@ class CreateDockerTests(unittest.TestCase):
                      gpu_toolkit=True, agent_installed=False, agent_states=(1,),
                      image_tags="latest\n202608\n202609\n<none>\n", persistent_files=None,
                      existing_containers="", home_files=None, memtotal_kib=14991536,
-                     osrelease="7.0.0-31-generic\n", missing_programs=()):
+                     osrelease="7.0.0-31-generic\n", missing_programs=(), host_pub=True,
+                     box_ssh_owned_by_root=False, state_files=None, home_label="true"):
         commands = []
         self.commands = commands
         self.prompts = prompts = []
         self.agent_environments = []
+        self.installed_keys = installed_keys = []
         agent_states = list(agent_states)
 
         def run(command, **kwargs):
@@ -56,8 +57,12 @@ class CreateDockerTests(unittest.TestCase):
                 raise FileNotFoundError(command[0])
             if command[:3] == ["docker", "image", "ls"]:
                 return subprocess.CompletedProcess(command, 0, stdout=image_tags)
+            if command[:3] == ["docker", "image", "inspect"]:
+                return subprocess.CompletedProcess(command, 0, stdout=f"{home_label}\n")
             if command[:2] == ["docker", "ps"]:
                 return subprocess.CompletedProcess(command, 0, stdout=existing_containers)
+            if command[:2] == ["docker", "cp"]:
+                installed_keys.append((command[-1], Path(command[-2]).read_text()))
             if command[0] == "ssh-add":
                 self.agent_environments.append(kwargs["env"])
                 if command == ["ssh-add", "-l"]:
@@ -81,12 +86,15 @@ class CreateDockerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             mount_root = home / "docker_mount/test-dev"
+            state_root = home / "docker_mount/.devbox/test-dev"
             self.home = home
             self.mount_root = str(mount_root)
-            for relative, content in (persistent_files or {}).items():
-                path = mount_root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content)
+            self.state_root = str(state_root)
+            for root, files in ((mount_root, persistent_files), (state_root, state_files)):
+                for relative, content in (files or {}).items():
+                    path = root / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content)
             unit_path = home / ".config/systemd/user/docker-ssh-agent.service"
             if agent_installed:
                 unit_path.parent.mkdir(parents=True)
@@ -94,9 +102,11 @@ class CreateDockerTests(unittest.TestCase):
                 (home / ".ssh-agent").mkdir()
             if gitconfig:
                 (home / ".gitconfig").touch()
-            if with_keys:
+            if host_pub:
                 (home / ".ssh").mkdir()
                 (home / ".ssh/id_ed25519.pub").write_text("ssh-ed25519 AAAAhost host\n")
+            if with_keys:
+                (home / ".ssh").mkdir(exist_ok=True)
                 # Keys that log in to the host (e.g. from a laptop); the restricted one is skipped.
                 (home / ".ssh/authorized_keys").write_text(
                     "ssh-ed25519 AAAAlaptop laptop\nfrom=\"10.0.0.1\" ssh-ed25519 AAAArestricted restricted\n"
@@ -117,6 +127,19 @@ class CreateDockerTests(unittest.TestCase):
             def expand(path):
                 return str(home / path[2:]) if path.startswith("~/") else expanduser(path)
 
+            box_ssh = mount_root / ".ssh"
+            real_chmod = os.chmod
+
+            def chmod(path, mode, *args, **kwargs):
+                # A box can leave its .ssh owned by root; the host user then gets EPERM.
+                if box_ssh_owned_by_root and str(path) == str(box_ssh):
+                    raise PermissionError(1, "Operation not permitted", str(path))
+                return real_chmod(path, mode, *args, **kwargs)
+
+            if box_ssh_owned_by_root:
+                box_ssh.mkdir(parents=True, exist_ok=True)
+                real_chmod(box_ssh, 0o500)
+
             with (
                 patch("builtins.input", side_effect=reply),
                 patch("builtins.print") as printed,
@@ -125,6 +148,7 @@ class CreateDockerTests(unittest.TestCase):
                 patch("os.path.exists", side_effect=lambda path: True if path == "/dev/nvidiactl" else path_exists(path)),
                 patch("subprocess.run", side_effect=run),
                 patch("os.geteuid", return_value=1000),
+                patch("os.chmod", side_effect=chmod),
                 patch("time.sleep"),
                 patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if gpu_toolkit else None),
                 patch("devbox_lib.container.CDI_SPEC_DIRS", ()),
@@ -137,18 +161,22 @@ class CreateDockerTests(unittest.TestCase):
                 else:
                     self.assertEqual(DEVBOX_MAIN(["create"]), 0)
             self.output = "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
-            keys_path = mount_root / ".ssh/authorized_keys"
-            self.written_keys = keys_path.read_text() if keys_path.exists() else None
+            if box_ssh_owned_by_root:
+                real_chmod(box_ssh, 0o700)
+            self.written_keys = installed_keys[-1][1] if installed_keys else None
             self.agent_unit = unit_path.read_text() if unit_path.exists() else None
             self.agent_socket = str(home / ".ssh-agent/docker-agent.sock")
-            self.persistent_dirs = {
-                name: (mount_root / name).stat().st_mode & 0o777
-                for name in (".codex", ".claude", ".dsh", ".agents", ".npm", ".npm-global")
-                if (mount_root / name).is_dir()
+            self.home_modes = {
+                name: (mount_root / name).stat().st_mode & 0o777 for name in (".", ".ssh") if (mount_root / name).is_dir()
             }
+            self.home_listing = sorted(os.listdir(mount_root)) if mount_root.is_dir() else []
             self.persistent_files = {
                 relative: (mount_root / relative).read_text() if (mount_root / relative).exists() else None
                 for relative in (persistent_files or {})
+            }
+            self.state_files = {
+                relative: (state_root / relative).read_text() if (state_root / relative).exists() else None
+                for relative in {**(persistent_files or {}), **(state_files or {})}
             }
             self.home_files = {
                 relative: (home / relative).read_text() if (home / relative).exists() else None
@@ -170,7 +198,7 @@ class CreateDockerTests(unittest.TestCase):
 
     def test_creation_uses_profile_and_all_ports_without_ssh_collision(self):
         create = self.created(self.run_creation())
-        self.assertEqual(self.port_bindings(create), ["2222:22", "8000-8099:8000-8099/tcp"])
+        self.assertEqual(self.port_bindings(create), ["127.0.0.1:2222:22", "127.0.0.1:8000-8099:8000-8099/tcp"])
         self.assertEqual(create[create.index("--memory") + 1], "10g")
         self.assertEqual(create[create.index("--memory-swap") + 1], "12g")
         self.assertIn("memlock=-1:-1", create)
@@ -211,34 +239,52 @@ class CreateDockerTests(unittest.TestCase):
         with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
             DEVBOX_MAIN(["create", "--no-gpu"])
 
-    def test_creation_mounts_private_tool_state_and_runtime_npm_directories(self):
+    def test_the_whole_home_is_mounted_and_kept_private(self):
         create = self.created(self.run_creation())
-        for name in (".codex", ".claude", ".dsh", ".agents", ".npm", ".npm-global"):
-            with self.subTest(directory=name):
-                self.assertIn(f"{self.mount_root}/{name}:/root/{name}", create)
-                self.assertEqual(self.persistent_dirs[name], 0o700)
-        # Empty bind mounts must not hide the toolchains installed in the image.
-        self.assertFalse(any(arg.endswith((":/root", ":/root/.local", ":/usr/local")) for arg in create))
+        mounts = [create[i + 1] for i, value in enumerate(create) if value == "-v"]
+        self.assertIn(f"{self.mount_root}:/root", mounts)
+        # Only read-only files from the host go inside it, so nothing hides part of the home.
+        self.assertEqual([mount for mount in mounts if ":/root/" in mount], [f"{self.home}/.gitconfig:/root/.gitconfig:ro"])
+        self.assertEqual(self.home_modes, {".": 0o700, ".ssh": 0o700})
+        # Host keys and added keys stay out of the box's view.
+        self.assertEqual(self.home_listing, [".ssh", "data"])
 
-    def test_recreation_and_failed_start_preserve_tool_state_and_installed_packages(self):
+    def test_recreation_and_failed_start_preserve_everything_in_the_home(self):
         files = {
-            ".codex/config.toml": 'model = "example"\n',
             ".codex/auth.json": '{"test": "dummy-token"}\n',
-            ".claude/.claude.json": '{"test": "account-state"}\n',
             ".claude/projects/example/session.jsonl": '{"test": "session"}\n',
             ".dsh/.credentials.yaml": "test: dummy-key\n",
-            ".dsh/profiles/web/cordis.patch.yml": "[]\n",
-            ".agents/skills/example/SKILL.md": "example skill\n",
-            ".npm/npmrc": "registry=https://registry.npmjs.org/\n",
-            ".npm-global/lib/node_modules/example/package.json": '{"name": "example"}\n',
             ".npm-global/bin/example": "#!/bin/sh\necho example\n",
+            ".cargo/bin/example": "cargo-installed\n",
+            ".local/bin/example": "uv-tool-installed\n",
+            ".cache/huggingface/model": "weights\n",
+            ".config/gh/hosts.yml": "github.com: {}\n",
+            ".bashrc": "# edited by hand\n",
+            ".bash_history": "nvcc --version\n",
+            "data/project/main.cu": "int main() {}\n",
         }
         for failing in (None, ["docker", "start"]):
             with self.subTest(failing=failing):
                 create = self.created(self.run_creation(failing, persistent_files=files))
-                self.assertIn(f"{self.mount_root}/.codex:/root/.codex", create)
-                self.assertIn(f"{self.mount_root}/.dsh:/root/.dsh", create)
+                self.assertIn(f"{self.mount_root}:/root", create)
                 self.assertEqual(self.persistent_files, files)
+
+    def test_a_new_home_gets_the_image_startup_files_once_the_box_runs(self):
+        commands = self.run_creation()
+        seed = next(command for command in commands if container.SEED_HOME_SCRIPT in command)
+        self.assertEqual(seed[:3], ["docker", "exec", "test-container"])
+        self.assertLess(commands.index(["docker", "start", "test-container"]), commands.index(seed))
+        self.assertIn(f"Its /root is {self.mount_root} on the host", self.output)
+
+    def test_an_image_without_the_persistent_home_label_asks_first(self):
+        with self.assertRaisesRegex(SystemExit, "Nothing was created"):
+            self.run_creation(home_label="", answers={"Continue anyway": [""]})
+        self.assertFalse(any("container name" in prompt for prompt in self.prompts))
+        self.assertFalse(any(command[:2] == ["docker", "create"] for command in self.commands))
+        self.assertIn("cuda-devbox:latest", self.created(self.run_creation(home_label="", answers={"Continue anyway": ["y"]})))
+        self.assertIn("devbox build", self.output)
+        self.run_creation()
+        self.assertFalse(any("Continue anyway" in prompt for prompt in self.prompts))
 
     def test_recreation_keeps_private_keys_generated_in_the_box(self):
         # The host never copies private keys in, so these were made inside the box.
@@ -247,8 +293,8 @@ class CreateDockerTests(unittest.TestCase):
         self.assertEqual(self.persistent_files, box_keys)
 
     def test_first_creation_generates_box_host_keys_and_points_sshd_at_them(self):
-        commands = self.run_creation(answers={"password login": ["y"]}, with_keys=True)
-        key_dir = f"{self.mount_root}/ssh-host-keys"
+        commands = self.run_creation(with_keys=True)
+        key_dir = f"{self.state_root}/ssh-host-keys"
         generations = self.host_key_generations(commands)
         self.assertEqual(
             [(command[command.index("-t") + 1], command[command.index("-f") + 1], command[command.index("-C") + 1])
@@ -265,8 +311,7 @@ class CreateDockerTests(unittest.TestCase):
             [f"HostKey=/etc/ssh/host-keys/ssh_host_{key_type}_key" for key_type in ("ed25519", "ecdsa", "rsa")],
         )
         # An image without built-in keys fails a plain `sshd -t`.
-        check = next(command for command in commands if command[-1:] != ["chpasswd"] and "-t" in command
-                     and command[:2] == ["docker", "exec"])
+        check = next(command for command in commands if "-t" in command and command[:2] == ["docker", "exec"])
         self.assertEqual(check[check.index("-t") + 1:], daemon_options)
         self.assertIn("PasswordAuthentication=no", daemon_options)
 
@@ -276,11 +321,23 @@ class CreateDockerTests(unittest.TestCase):
         ed25519_only = {"ssh-host-keys/ssh_host_ed25519_key": "ed25519 host key\n"}
         for existing, generated in ((all_keys, []), (ed25519_only, ["ecdsa", "rsa"])):
             with self.subTest(existing=sorted(existing)):
-                commands = self.run_creation(persistent_files=existing)
+                commands = self.run_creation(state_files=existing)
                 self.assertEqual(
                     [command[command.index("-t") + 1] for command in self.host_key_generations(commands)], generated,
                 )
-                self.assertEqual(self.persistent_files, existing)
+                self.assertEqual(self.state_files, existing)
+
+    def test_devbox_files_in_an_older_home_move_out_of_the_box(self):
+        legacy = {
+            **{f"ssh-host-keys/ssh_host_{key_type}_key": f"{key_type} host key\n" for key_type in ("ed25519", "ecdsa", "rsa")},
+            "ssh-authorized-keys": "ssh-ed25519 AAAAphone phone\n",
+        }
+        commands = self.run_creation(persistent_files=legacy)
+        self.assertEqual(self.host_key_generations(commands), [])
+        self.assertEqual(self.state_files, legacy)
+        self.assertEqual(self.persistent_files, dict.fromkeys(legacy))
+        self.assertIn(f"{self.state_root}/ssh-host-keys:/etc/ssh/host-keys:ro", self.created(commands))
+        self.assertEqual(self.written_keys.splitlines(), ["ssh-ed25519 AAAAhost host", "ssh-ed25519 AAAAphone phone"])
 
     def test_missing_ssh_keygen_stops_before_container_creation(self):
         with self.assertRaisesRegex(SystemExit, "ssh-keygen is not installed"):
@@ -346,7 +403,8 @@ class CreateDockerTests(unittest.TestCase):
             # Re-asked: inside the dev range 62000-62099.
             "port 22": ["62050", "61000"],
         })
-        self.assertEqual(self.port_bindings(self.created(commands)), ["61000:22", "62000-62099:8000-8099/tcp"])
+        self.assertEqual(self.port_bindings(self.created(commands)),
+                         ["127.0.0.1:61000:22", "127.0.0.1:62000-62099:8000-8099/tcp"])
 
     def test_gpu_defaults_to_all_without_an_enable_question(self):
         create = self.created(self.run_creation())
@@ -456,8 +514,8 @@ class CreateDockerTests(unittest.TestCase):
         self.assertIsNone(self.agent_unit)
         self.assertFalse(any(command[0] in ("ssh-add", "systemctl") for command in commands))
 
-    def test_port_binding_or_password_failure_or_ctrl_c_removes_only_new_container(self):
-        for failing in (["docker", "start"], ["docker", "exec"]):
+    def test_key_install_start_or_check_failure_or_ctrl_c_removes_only_new_container(self):
+        for failing in (["docker", "cp"], ["docker", "start"], ["docker", "exec"]):
             for interrupt in (False, True):
                 with self.subTest(failing=failing, interrupt=interrupt):
                     commands = self.run_creation(failing, interrupt=interrupt)
@@ -467,22 +525,40 @@ class CreateDockerTests(unittest.TestCase):
         commands = self.run_creation(["docker", "create"])
         self.assertFalse(any(command[:2] == ["docker", "rm"] for command in commands))
 
-    def test_key_only_authorizes_only_host_keys_and_skips_missing_gitconfig(self):
-        commands = self.run_creation(answers={"password login": ["y"]}, with_keys=True, gitconfig=False)
+    def test_only_public_keys_log_in_and_missing_gitconfig_is_skipped(self):
+        commands = self.run_creation(with_keys=True, gitconfig=False)
         create = self.created(commands)
+        self.assertFalse(any("password" in prompt.lower() for prompt in self.prompts))
         self.assertIn("PasswordAuthentication=no", create)
         self.assertIn("KbdInteractiveAuthentication=no", create)
         self.assertIn("PermitRootLogin=prohibit-password", create)
-        self.assertFalse(any(command[-1] == "chpasswd" for command in commands))
+        self.assertFalse(any("chpasswd" in command for command in commands))
         self.assertFalse(any(":/root/.gitconfig" in argument for argument in create))
+        # Host keys only: the earlier box's key and the restricted from= line are left out.
         self.assertEqual(set(self.written_keys.splitlines()), {"ssh-ed25519 AAAAhost host", "ssh-ed25519 AAAAlaptop laptop"})
 
-    def test_key_only_without_public_keys_refuses_to_create_container(self):
-        # Keys left in the box's authorized_keys do not count; only the host's do.
+    def test_keys_go_in_through_docker_before_start_even_when_box_ssh_is_root_owned(self):
+        leftover = {".ssh/authorized_keys": "ssh-ed25519 AAAAremote remote\n"}
+        commands = self.run_creation(persistent_files=leftover, box_ssh_owned_by_root=True)
+        self.assertEqual(self.installed_keys, [("test-container:/root/.ssh/authorized_keys", "ssh-ed25519 AAAAhost host\n")])
+        install = next(command for command in commands if command[:2] == ["docker", "cp"])
+        self.assertLess(commands.index(self.created(commands)), commands.index(install))
+        self.assertLess(commands.index(install), commands.index(["docker", "start", "test-container"]))
+        # The host-side path is never written; docker cp replaces the file the box sees.
+        self.assertEqual(self.persistent_files, leftover)
+
+    def test_keys_added_with_devbox_key_add_are_authorized_with_the_host_keys(self):
+        added = {"ssh-authorized-keys": "ssh-ed25519 AAAAphone phone\nssh-ed25519 AAAAhost same key, other comment\n"}
+        self.run_creation(state_files=added)
+        self.assertEqual(self.written_keys.splitlines(), ["ssh-ed25519 AAAAhost host", "ssh-ed25519 AAAAphone phone"])
+
+    def test_without_any_public_key_create_refuses_before_other_questions(self):
+        # Keys left in the box's authorized_keys do not count; only the host's and added ones do.
         for box_files in ({}, {".ssh/authorized_keys": "ssh-ed25519 AAAAremote remote\n"}):
             with self.subTest(box_files=box_files):
-                with self.assertRaisesRegex(SystemExit, "public key"):
-                    self.run_creation(answers={"password login": ["y"]}, persistent_files=box_files)
+                with self.assertRaisesRegex(SystemExit, "devbox key add test-dev"):
+                    self.run_creation(host_pub=False, persistent_files=box_files)
+                self.assertFalse(any("port 22" in prompt for prompt in self.prompts))
                 self.assertFalse(any(command[:2] == ["docker", "create"] for command in self.commands))
 
 
