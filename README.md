@@ -25,8 +25,8 @@ host/devbox build
 # 2. Create a container interactively (recommended)
 host/devbox create
 
-# 3. SSH in
-ssh root@localhost -p <the host port you chose>
+# 3. SSH in from the host (ports are published on 127.0.0.1 only; from another machine see "Connecting")
+ssh root@127.0.0.1 -p <the host port you chose>
 ```
 
 Every host-side task goes through one command, `host/devbox` (`host/devbox --help` lists them):
@@ -35,6 +35,7 @@ Every host-side task goes through one command, `host/devbox` (`host/devbox --hel
 | --- | --- |
 | `host/devbox build [--pull] [--no-cache] [--build-arg NAME=VALUE]` | Build the image, tagged with the version in `VERSION` and with `latest` |
 | `host/devbox create` | Interactively create a container (every setting is a prompt) |
+| `host/devbox key add <container-name>` | Authorize an SSH public key pasted from another machine; `key list` shows the authorized keys, `key remove` revokes one ([details](#adding-a-public-key)) |
 | `host/devbox memory [--profile 16] [--apply]` | Preview, or with `sudo` and `--apply` install, host HugeTLB/CMA/NUMA settings for the next boot |
 | `host/devbox agent install` | One-time: run a persistent host SSH agent for containers |
 | `host/devbox agent refresh <container-name>` | Legacy containers only: restart the per-container SSH agent proxy |
@@ -48,7 +49,8 @@ Every host-side task goes through one command, `host/devbox` (`host/devbox --hel
 | Base image | NVIDIA CUDA 13.3.1 cuDNN devel / Ubuntu 26.04 (Resolute Raccoon) |
 | Package sources | Official upstreams only (apt, rustup, npm, Maven/Gradle); no mirrors configured |
 | Compiler | Clang by default; GCC also available |
-| SSH | Configured; root login by password and/or key. Every SSH session, `ssh <container> <command>` and VS Code's remote server included, gets the same tool environment (`PATH`, `CUDA_HOME`, `JAVA_HOME`, ...) as `docker exec`, from sshd's `SetEnv` |
+| SSH | Root login with SSH public keys only (no password login), on ports published to the host's `127.0.0.1` only: other machines jump through the host. Every SSH session, `ssh <container> <command>` and VS Code's remote server included, gets the same tool environment (`PATH`, `CUDA_HOME`, `JAVA_HOME`, ...) as `docker exec`, from sshd's `SetEnv` |
+| Home | `/root` is `~/docker_mount/<container-name>` on the host: logins, shell history, caches, and commands installed into the home (npm, cargo, uv tool) survive recreation and image updates. The image's own tools live outside it |
 | GPU | CUDA 13.3.1 + cuDNN; select all GPUs (default), individual indices, or ranges when Docker GPU support is available |
 | Timezone | Asia/Tokyo |
 | Locale | `C.UTF-8` everywhere: `docker exec`, SSH logins, and `ssh <container> <command>` alike. It is UTF-8, so Chinese, Japanese, and other text work; dates, sorting, and messages follow English/POSIX conventions. The SSH client's `LANG`/`LC_*` are not accepted. `en_US.UTF-8` is also generated for programs that ask for it by name |
@@ -152,9 +154,9 @@ Use `host/devbox create` to create a container interactively:
 host/devbox create
 ```
 
-It takes no options; every setting is asked for. It needs a native Linux host (WSL isn't supported) with at least 6.625 GiB of usable RAM for the smallest memory profile; otherwise it exits before the first question. It also runs the host's `ssh-keygen` (from the OpenSSH client) to make the container's [SSH host keys](#ssh-host-keys). For example, for SSH port `61000`, dev ports `62000–62099`, and key-only login, answer the dev-port start with `62000`, the SSH port with `61000`, and the password-login question with `y`.
+It takes no options; every setting is asked for. It needs a native Linux host (WSL isn't supported) with at least 6.625 GiB of usable RAM for the smallest memory profile; otherwise it exits before the first question. It also runs the host's `ssh-keygen` (from the OpenSSH client) to make the container's [SSH host keys](#ssh-host-keys). For example, for SSH port `61000` and dev ports `62000–62099`, answer the dev-port start with `62000` and the SSH port with `61000`.
 
-Press Enter at the image-tag prompt to take `cuda-devbox:latest` (or the newest local versioned build, such as `cuda-devbox:202610-2`, if `latest` is absent). You can also type another tag such as `202608`, or a full image name such as `other/image:1.0`. For a plain container, answer `n` to the SSH agent, sandbox compatibility, privileged mode, and kernel passthrough prompts. The dev ports are always 100 consecutive host ports starting at the start port, mapped onto container `8000-8099`: start `62000` gives host `62000-62099` (host `62080` reaches a service on container port `8080`). The SSH port can't fall inside that host range. Key-only login disables password login and requires a public key. The GPU question is only asked when Docker can actually use the GPU; otherwise the script warns and leaves the GPU out. The container's `authorized_keys` gets the host's own `~/.ssh/*.pub` plus every key in the host's `~/.ssh/authorized_keys` (so a laptop that can SSH into the host can SSH into the container too; lines with options such as `from=` are skipped). The host is the only source: every create rewrites the file, so recreating a container drops keys that are no longer on the host and keys added inside the container. Private keys in the container's `.ssh` are left alone. The `~/.gitconfig` mount is skipped if the host doesn't have one.
+Press Enter at the image-tag prompt to take `cuda-devbox:latest` (or the newest local versioned build, such as `cuda-devbox:202610-2`, if `latest` is absent). You can also type another tag such as `202608`, or a full image name such as `other/image:1.0`. An image built before the home was persisted (one without the `cuda-devbox.persistent-home` label, or a full name not pulled yet) keeps its default Python in `/root`, where the mounted home would hide it: create warns and asks whether to continue before the name question. For a plain container, answer `n` to the SSH agent, sandbox compatibility, privileged mode, and kernel passthrough prompts. The dev ports are always 100 consecutive host ports starting at the start port, mapped onto container `8000-8099`: start `62000` gives host `62000-62099` (host `62080` reaches a service on container port `8080`). The SSH port can't fall inside that host range. Both are published on the host's `127.0.0.1` only. The GPU question is only asked when Docker can actually use the GPU; otherwise the script warns and leaves the GPU out. Login is by SSH public key only; there is no password login. The container's `authorized_keys` gets the host's own `~/.ssh/*.pub`, every key in the host's `~/.ssh/authorized_keys` (so a laptop that can SSH into the host can reach the container too; lines with options such as `from=` are skipped), and the keys added with [`devbox key add`](#adding-a-public-key). With none of these, create stops right after the name question. These are the only sources: every create rewrites the file, so recreating a container drops keys that are no longer listed there and keys added inside the container. Private keys in the container's `.ssh` are left alone. The `~/.gitconfig` mount is skipped if the host doesn't have one.
 
 The GPU selection defaults to `all`; enter `0,2` for individual host GPU indices, `0-3` for an inclusive range, or `0,2-4` to combine them. Repeated indices are removed, and malformed inputs are re-asked. For example, `0,2-3` becomes Docker's `--gpus '"device=0,2,3"'`. Use `nvidia-smi -L` on the host to see its GPU indices.
 
@@ -162,10 +164,10 @@ The script asks, in order:
 
 ```
 Image tag for cuda-devbox (latest, 202609, 202608; default latest; or a full image name):   # Enter = latest
+Continue anyway? (y/N):             # only for an image without the persistent-home label
 Enter the container name:           # e.g. my-dev; re-asked if invalid or already in use
 Host start port for the 100 dev ports mapped to container 8000-8099 (default 8000):   # 62000 -> 62000-62099
 Enter the host port to map to container's port 22 (default 2222):    # must not overlap the dev-port range
-Disable password login and allow SSH public keys only? (y/N):
 Host RAM profile (auto/8/16/32/64, default auto):     # Enter = the largest profile that fits usable memory
 NVIDIA GPUs to use (all, 0,2, or 0-3; default all):   # Enter = all; only asked when Docker can use the GPU
 Forward host SSH agent into the container? (y/N):
@@ -174,39 +176,34 @@ Enable privileged mode and host Docker socket access? (Y/n):  # for all GPUs; su
 Enable host kernel development passthrough for bpftrace/HugeTLB/CMA/NUMA? (Y/n):  # on by default
 ```
 
-The container name follows Docker's naming rule (letters, digits, `_`, `.`, `-`, starting with a letter or digit) and is limited to 63 characters because it is also the hostname. It names the state directory `~/docker_mount/<container-name>`, so an invalid name (empty, `..`, containing `/`) or the name of an existing container is asked again before anything on the host changes.
+The container name follows Docker's naming rule (letters, digits, `_`, `.`, `-`, starting with a letter or digit) and is limited to 63 characters because it is also the hostname. It names the container's home `~/docker_mount/<container-name>` and its devbox state directory `~/docker_mount/.devbox/<container-name>`, so an invalid name (empty, `..`, containing `/`) or the name of an existing container is asked again before anything on the host changes.
 
 A full image name typed at the image-tag prompt can only have one tag-separating colon. `dev:ubuntu:26.04` is invalid; to express namespace/repository/tag, use `dev/ubuntu:26.04`, or a single repo name like `dev-ubuntu:26.04`.
 
 ### Container launch parameters
 
-The script uses `docker create`, `docker start`, then sets the SSH password (key-only login skips that step) and checks the sshd config; if creation or initialization fails, or you press Ctrl-C during initialization, only the newly created container is cleaned up. The successful default-port-range path is roughly equivalent to:
+The script uses `docker create`, writes `authorized_keys` into it with `docker cp`, then `docker start`, gives a new home Ubuntu's `.bashrc` and `.profile` for root, and checks the sshd config; if creation or initialization fails, or you press Ctrl-C during initialization, only the newly created container is cleaned up. The successful default-port-range path is roughly equivalent to:
 
 ```bash
 docker run -d \
     --name <container-name> \
     --hostname <container-name> \
-    -p <host-port>:22 \
-    -p 8000-8099:8000-8099/tcp \
+    -p 127.0.0.1:<host-port>:22 \
+    -p 127.0.0.1:8000-8099:8000-8099/tcp \
     --memory 10g \
     --memory-swap 12g \
-    -v ~/docker_mount/<container-name>/data:/root/data \
-    -v ~/docker_mount/<container-name>/.vscode-server:/root/.vscode-server \
+    -v ~/docker_mount/<container-name>:/root \
+    -v ~/docker_mount/.devbox/<container-name>/ssh-host-keys:/etc/ssh/host-keys:ro \
     -v ~/.gitconfig:/root/.gitconfig:ro \
-    -v ~/docker_mount/<container-name>/.ssh:/root/.ssh \
-    -v ~/docker_mount/<container-name>/ssh-host-keys:/etc/ssh/host-keys:ro \
-    -v ~/docker_mount/<container-name>/.codex:/root/.codex \
-    -v ~/docker_mount/<container-name>/.claude:/root/.claude \
-    -v ~/docker_mount/<container-name>/.agents:/root/.agents \
-    -v ~/docker_mount/<container-name>/.npm:/root/.npm \
-    -v ~/docker_mount/<container-name>/.npm-global:/root/.npm-global \
     [--gpus all] \
     --entrypoint /usr/sbin/sshd \
     --restart unless-stopped \
     <image-name> -D -e \
     -o HostKey=/etc/ssh/host-keys/ssh_host_ed25519_key \
     -o HostKey=/etc/ssh/host-keys/ssh_host_ecdsa_key \
-    -o HostKey=/etc/ssh/host-keys/ssh_host_rsa_key
+    -o HostKey=/etc/ssh/host-keys/ssh_host_rsa_key \
+    -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+    -o PermitRootLogin=prohibit-password
 ```
 
 The memory values above are the 16 GiB profile; other profiles are in the table below. With `all` GPUs, the script offers `--privileged` plus the host Docker socket by default. With specific GPU indices, it uses nonprivileged mode and asks only `Enable host Docker socket access? (Y/n):`, because privileged mode exposes all host devices and defeats GPU selection. Host kernel development passthrough is also enabled by default. Kernel dev passthrough appends:
@@ -356,7 +353,7 @@ Expect `HugePages_Total=512`, `Hugepagesize=2048 kB`, `CmaTotal=262144 kB`, swap
 
 Re-applying replaces both managed files; the previous version is backed up as `.previous` alongside the same path, and the original `/boot/grub/grub.cfg` is backed up to `/boot/grub/grub.cfg.ubuntubase-previous`. A failed update restores the config, generated GRUB file, and file permissions; if that restoration also fails, the script errors explicitly. To undo the very first apply, delete the two managed files, run `sudo update-grub`, and reboot; if the files already existed before you applied, restore their `.previous` backups instead, then update GRUB and reboot. Other custom sysctl files may also affect the final numbers.
 
-Existing containers can't gain new port mappings, mounts, devices, or security options via `docker start`; you need to remove and recreate them. Data under `~/docker_mount/<container-name>` is preserved. When upgrading from an older version that did not mount AI/npm state, follow [Migrating an existing container](#migrating-an-existing-container) **before removing it**:
+Existing containers can't gain new port mappings, mounts, devices, or security options via `docker start`; you need to remove and recreate them. The home under `~/docker_mount/<container-name>` is preserved. When upgrading a container created before the whole home was mounted, follow [Migrating an existing container](#migrating-an-existing-container) **before removing it**:
 
 ```bash
 docker rm -f <container-name>
@@ -367,66 +364,80 @@ host/devbox create
 
 | Host path | Container path | Purpose |
 | --- | --- | --- |
-| `~/docker_mount/<container-name>/data` | `/root/data` | Persistent data storage |
-| `~/docker_mount/<container-name>/.vscode-server` | `/root/.vscode-server` | VS Code Server cache (speeds up remote reconnects) |
+| `~/docker_mount/<container-name>` | `/root` | The whole home (see below) |
 | `~/.gitconfig` | `/root/.gitconfig` (ro) | Shared Git config |
-| `~/docker_mount/<container-name>/.ssh` | `/root/.ssh` | `authorized_keys` (generated from host public keys) |
-| `~/docker_mount/<container-name>/ssh-host-keys` | `/etc/ssh/host-keys` (ro) | The container's own [SSH host keys](#ssh-host-keys) |
-| `~/docker_mount/<container-name>/.codex` | `/root/.codex` | Codex configuration, file-based login, sessions, and plugins |
-| `~/docker_mount/<container-name>/.claude` | `/root/.claude` | Claude configuration, login, sessions, memory, and plugins |
-| `~/docker_mount/<container-name>/.dsh` | `/root/.dsh` | DeepSeek Harness credentials, configuration, profiles, and sessions |
-| `~/docker_mount/<container-name>/.agents` | `/root/.agents` | Shared user skills, including `~/.agents/skills` |
-| `~/docker_mount/<container-name>/.npm` | `/root/.npm` | npm download cache and user config (`npmrc`) |
-| `~/docker_mount/<container-name>/.npm-global` | `/root/.npm-global` | Runtime npm global packages and their command links |
+| `~/docker_mount/.devbox/<container-name>/ssh-host-keys` | `/etc/ssh/host-keys` (ro) | The container's own [SSH host keys](#ssh-host-keys) |
+| `~/docker_mount/.devbox/<container-name>/ssh-authorized-keys` | not mounted | Public keys added with [`devbox key add`](#adding-a-public-key) |
 
-These are **bind mounts** into host directories, not Docker-managed named volumes. `docker rm` removes the container's writable layer but leaves these directories intact. Recreate using the **same container name** to reuse them; another name gets separate state. New tool-state directories are created with mode `0700`. Keep the host directories when rebuilding or cleaning up containers.
+Everything in the home is kept, for example:
+
+| In the home | What it holds |
+| --- | --- |
+| `data` | Projects and other data |
+| `.ssh` | `authorized_keys` (written by devbox from the host's public keys and the added keys) and keys made inside the container |
+| `.codex`, `.claude`, `.dsh`, `.agents` | Codex, Claude, and DeepSeek Harness configuration, logins, sessions, and plugins; shared skills in `~/.agents/skills` |
+| `.npm`, `.npm-global` | npm cache, user config (`npmrc`), and runtime global packages with their commands |
+| `.cargo/bin`, `.local/bin` | Commands from `cargo install`, `uv tool install`, and `pip install --user` |
+| `.cache`, `.config`, `.bash_history`, `.vscode-server` | Caches (uv, pip, Hugging Face, ...), other tools' settings, shell history, VS Code Server and its extensions |
+
+These are **bind mounts** of host directories, not Docker-managed named volumes. `docker rm` removes the container's writable layer but leaves them intact. Recreate using the **same container name** to reuse them; another name gets separate state. Keep the host directories when rebuilding or cleaning up containers.
+
+The home is created with mode `0700`, with only `data` and `.ssh` in it. Once the container runs, create copies in Ubuntu's `.bashrc` and `.profile` for root, the same files the image's own `/root` has; existing ones are left alone, so edits to them are kept. Docker also creates an empty `.gitconfig` there as the mount point for the host's file. The image keeps nothing it needs in `/root`, so an empty home hides nothing.
+
+Files devbox manages for a container live in `~/docker_mount/.devbox/<container-name>`, outside the home, so nothing inside the container can change them. For a container created by an older version, create and `devbox key` move them there from the home.
+
+Only the home is kept. Packages installed with `apt`, rustup toolchains (in `/usr/local/rustup`), the cargo download cache (in `CARGO_HOME=/usr/local/cargo`), and anything else written outside `/root` are lost when the container is removed; add lasting system changes to the Dockerfile instead.
 
 ### AI state and npm packages
 
-The image sets `CLAUDE_CONFIG_DIR=/root/.claude`, so Claude's global `.claude.json` is also stored inside the mounted directory, alongside settings and credentials. This avoids a separate single-file mount that can interfere with atomic file replacement. Codex uses its default `/root/.codex`; file-backed credentials persist there (an OS keyring or ephemeral login is not saved by this mount). See [OpenAI's credential storage documentation](https://developers.openai.com/codex/auth/#credential-storage) and [Claude's configuration directory](https://code.claude.com/docs/en/env-vars).
+The image sets `CLAUDE_CONFIG_DIR=/root/.claude`, so Claude's global `.claude.json` is also stored inside the mounted directory, alongside settings and credentials. This avoids a separate single-file mount that can interfere with atomic file replacement. Codex uses its default `/root/.codex`; file-backed credentials persist there (an OS keyring or ephemeral login is not saved in the home). See [OpenAI's credential storage documentation](https://developers.openai.com/codex/auth/#credential-storage) and [Claude's configuration directory](https://code.claude.com/docs/en/env-vars).
 
 For npm, there are three separate kinds of data:
 
-- **Image tools**: Node.js, npm, TypeScript, Codex, Claude, and DeepSeek Harness stay in `/usr/local`. They remain available even when the new mounts are empty.
+- **Image tools**: Node.js, npm, TypeScript, Codex, Claude, and DeepSeek Harness stay in `/usr/local`. They remain available with an empty home.
 - **Runtime global installs**: `npm install -g <package>` installs into `/root/.npm-global`, including `lib/node_modules` and `bin`. Its `bin` comes first in `PATH`, so a persisted CLI upgrade overrides the image's bundled version. This works in `docker exec` and SSH login/interactive shells.
-- **Project installs**: `npm install` creates `node_modules` within the project. Keep projects under `/root/data` (or another mounted directory) to preserve both source and dependencies. The npm cache alone does not preserve installed packages.
+- **Project installs**: `npm install` creates `node_modules` within the project. Keep projects in the home, such as under `/root/data`, to preserve both source and dependencies. The npm cache alone does not preserve installed packages.
 
-`NPM_CONFIG_USERCONFIG=/root/.npm/npmrc` also persists settings written by `npm config set` and `npm login`. The image exports these variables for SSH sessions as well as Docker commands. A rebuilt image is required to get this environment setup; mounts alone on an older image will not redirect npm global installs. If a new image changes Node.js major version or CPU architecture, reinstall packages containing native addons in the new environment.
+`NPM_CONFIG_USERCONFIG=/root/.npm/npmrc` also persists settings written by `npm config set` and `npm login`. The image exports these variables for SSH sessions as well as Docker commands. A rebuilt image is required to get this environment setup; mounting the home alone on an older image will not redirect npm global installs. If a new image changes Node.js major version or CPU architecture, reinstall packages containing native addons in the new environment.
 
 ### Migrating an existing container
 
-For a container created before these mounts were added, save its state **while it still exists**. Exit Codex/Claude/DeepSeek Harness and stop package installs first so files are not changing during the copy. The commands below assume the old container is running, use the default old paths, and keep a separate backup. Set `box` to its actual name:
+Containers created before the whole home was mounted kept only some directories of `/root` on the host (`data`, `.ssh`, `.vscode-server`, and, in later versions, the AI tool and npm directories). Those are already in `~/docker_mount/<container-name>`, so the new home picks them up. Everything else in `/root`, such as `.cache`, `.local`, `.config`, and `.bash_history`, lives only in the container: copy it out **while the container still exists**. Exit Codex/Claude/DeepSeek Harness and stop package installs first so files are not changing during the copy. The commands below assume the old container is running and keep a separate backup. Set `box` to its actual name:
 
 ```bash
 set -e
 box=my-dev
-state_dir="$HOME/docker_mount/$box"
+home_dir="$HOME/docker_mount/$box"
 backup_dir=$(mktemp -d "$HOME/devbox-backup.XXXXXX")
 
-for directory in .codex .claude .dsh .agents .npm .npm-global; do
-    if docker exec "$box" test -d "/root/$directory"; then
-        docker cp "$box:/root/$directory" "$backup_dir/$directory"
-    fi
-done
+# Copy each entry of the old /root that was not mounted from the host.
+mounts=$(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$box")
+docker exec "$box" find /root -mindepth 1 -maxdepth 1 -printf '%f\0' |
+    while IFS= read -r -d '' entry; do
+        grep -qxF "/root/$entry" <<< "$mounts" || docker cp "$box:/root/$entry" "$backup_dir/"
+    done
 
-# Move the two legacy standalone config files into the new mounted directories.
-if [ ! -e "$backup_dir/.claude/.claude.json" ] && docker exec "$box" test -f /root/.claude.json; then
+# The old image installed its default Python in ~/.local; the new one has its own outside the home.
+rm -rf "$backup_dir/.local/share/uv/python" "$backup_dir"/.local/bin/python*
+
+# The oldest versions kept these two files where the current image does not read them.
+if [ -f "$backup_dir/.claude.json" ]; then
     mkdir -p "$backup_dir/.claude"
-    docker cp "$box:/root/.claude.json" "$backup_dir/.claude/.claude.json"
+    mv "$backup_dir/.claude.json" "$backup_dir/.claude/.claude.json"
 fi
-if [ ! -e "$backup_dir/.npm/npmrc" ] && docker exec "$box" test -f /root/.npmrc; then
+if [ -f "$backup_dir/.npmrc" ]; then
     mkdir -p "$backup_dir/.npm"
-    docker cp "$box:/root/.npmrc" "$backup_dir/.npm/npmrc"
+    mv "$backup_dir/.npmrc" "$backup_dir/.npm/npmrc"
 fi
 
 # Record old global installs so extra packages can be reinstalled after recreation.
-docker exec "$box" npm ls -g --depth=0 > "$backup_dir/npm-global-packages.txt"
-mkdir -p "$state_dir"
-cp -an "$backup_dir/." "$state_dir/"
+docker exec "$box" npm ls -g --depth=0 > "$backup_dir/npm-global-packages.txt" || true
+mkdir -p "$home_dir"
+cp -an "$backup_dir/." "$home_dir/"
 printf 'Backup saved to %s\n' "$backup_dir"
 ```
 
-Existing destination files are kept by `cp -an`; if both locations already contain state, review the backup before replacing any destination files. Rebuild the image with `host/devbox build`, then remove and recreate the container with the same name. Old packages under `/usr/local` were not persisted: use the saved package list to reinstall any extras with `npm install -g <package>@<version>` in the new container. Subsequent global installs and upgrades persist automatically. Files already lost by deleting an unmounted container cannot be recovered by adding a mount later.
+Existing destination files are kept by `cp -an`; if both locations already contain state, review the backup before replacing any destination files. The backup takes as much space as what it copied (caches can be several GiB); delete it once the new container works. Rebuild the image with `host/devbox build`, then remove and recreate the container with the same name. In projects whose `.venv` was made with the old default Python, run `uv sync` again. Interpreters you added with `uv python install` were removed with it; install them again if needed. Packages that very old versions installed under `/usr/local` were not kept: use the saved package list to reinstall extras with `npm install -g <package>@<version>`. Files already lost by deleting a container cannot be recovered later.
 
 ---
 
@@ -434,32 +445,60 @@ Existing destination files are kept by `cp -an`; if both locations already conta
 
 ### SSH
 
-```bash
-# Password login (set by the script after startup; the random password is shown once)
-ssh root@localhost -p <host-port>
+Ports are published on the host's `127.0.0.1` only, so the container can't be reached straight from the network, and login is by public key only. On the host:
 
-# Key login (the script copies the host's ~/.ssh/*.pub and ~/.ssh/authorized_keys public keys, never a private key)
-ssh root@localhost -p <host-port>
+```bash
+ssh root@127.0.0.1 -p <host-port>
 ```
+
+From another machine, jump through the host. In that machine's `~/.ssh/config`:
+
+```
+Host my-docker-dev
+    HostName 127.0.0.1
+    Port <host-port>
+    User root
+    ProxyJump <user>@<host>
+```
+
+The jump only relays the connection; the container checks the key of the machine you are on. A machine that logs in to the host with a key is already authorized, since that key is in the host's `~/.ssh/authorized_keys`. Otherwise, authorize it as below.
+
+### Adding a public key
+
+Log in to the host, then paste the other machine's public key: the one line in its `~/.ssh/id_ed25519.pub` (or another `.pub`), never the private key.
+
+```bash
+host/devbox key add <container-name>                  # paste the line when asked
+host/devbox key list <container-name>                 # fingerprint, comment, and where each key comes from
+host/devbox key remove <container-name> SHA256:...    # revoke a key added with `key add`
+```
+
+No `sudo` is needed. An added key is kept in `~/docker_mount/.devbox/<container-name>/ssh-authorized-keys`, so recreating the container keeps it, and it takes effect at once: devbox rewrites the container's `authorized_keys` with `docker cp`, which works whether the container is running or stopped, and even when work inside the container has left its `.ssh` directory owned by root on the host. A key can be added before the container exists; `devbox create` then uses it. `key remove` revokes only keys added this way. A key that comes from the host's `~/.ssh` stays authorized until it is deleted there; then run `key remove` with its fingerprint to refresh the container.
 
 ### SSH host keys
 
-The image ships without SSH host keys. The first `devbox create` for a container name runs the host's `ssh-keygen` to make Ed25519, ECDSA, and RSA host keys in `~/docker_mount/<container-name>/ssh-host-keys`, mounts them read-only, and points sshd at them alone. Each container gets its own keys, and recreating it with the same name, even from a newly built image, keeps them, so SSH clients don't see `REMOTE HOST IDENTIFICATION HAS CHANGED`. Older images still contain built-in keys, but sshd ignores them under the current script.
+The image ships without SSH host keys. The first `devbox create` for a container name runs the host's `ssh-keygen` to make Ed25519, ECDSA, and RSA host keys in `~/docker_mount/.devbox/<container-name>/ssh-host-keys`, mounts them read-only, and points sshd at them alone. Each container gets its own keys, and recreating it with the same name, even from a newly built image, keeps them, so SSH clients don't see `REMOTE HOST IDENTIFICATION HAS CHANGED`. Older images still contain built-in keys, but sshd ignores them under the current script.
 
 A container created before this change used the image's built-in keys, so its first recreation changes the host key once. Remove the old entry, then connect again and accept the new key:
 
 ```bash
-ssh-keygen -R '[localhost]:<host-port>'
+ssh-keygen -R '[127.0.0.1]:<host-port>'
 ```
 
-To replace a container's host keys, delete its `ssh-host-keys` directory before recreating it; clients then need the same `ssh-keygen -R`.
+To replace a container's host keys, delete `~/docker_mount/.devbox/<container-name>/ssh-host-keys` before recreating it; clients then need the same `ssh-keygen -R`.
 
 ### Port 8080
 
-A service inside the container needs to listen on `0.0.0.0:8080` for the host to reach it via `http://localhost:8080` (or `http://localhost:62080` when the container was created with dev start port `62000`). For example:
+A service inside the container needs to listen on `0.0.0.0:8080` for the host to reach it via `http://127.0.0.1:8080` (or `http://127.0.0.1:62080` when the container was created with dev start port `62000`). For example:
 
 ```bash
 python3 -m http.server 8080 --bind 0.0.0.0
+```
+
+The dev ports are published on the host's `127.0.0.1` only. From another machine, forward the port over SSH; VS Code Remote-SSH does this automatically. With the `my-docker-dev` entry above:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 my-docker-dev
 ```
 
 ### VS Code Remote-SSH
@@ -468,12 +507,12 @@ Add to VS Code's `~/.ssh/config`:
 
 ```
 Host my-docker-dev
-    HostName localhost
+    HostName 127.0.0.1
     Port 2222
     User root
 ```
 
-Then connect with the Remote-SSH extension. The `.vscode-server` directory is persisted, so reconnecting never needs to reinstall extensions.
+When VS Code runs on another machine, add `ProxyJump <user>@<host>` as in [SSH](#ssh). Then connect with the Remote-SSH extension. The `.vscode-server` directory is persisted, so reconnecting never needs to reinstall extensions.
 
 ---
 
@@ -491,15 +530,16 @@ Cuda-Dev-Box/
 │   ├── setup_cpp_libs.sh     # C/C++ library install (incl. GoogleTest)
 │   ├── setup_env.sh          # Docker ENV for SSH sessions (sshd SetEnv) and shells
 │   ├── setup_jvm.sh          # Kotlin install and JVM tool entrypoints
-│   ├── setup_python.sh       # uv-managed Python 3.14 install
+│   ├── setup_python.sh       # uv-managed Python 3.14 install, outside /root
 │   ├── setup_rust.sh         # rustfmt/clippy on top of the copied Rust toolchain
 │   ├── setup_ssh.sh          # SSH configuration
 │   └── setup_typescript.sh   # TypeScript, VS Code extension tools, Codex / Claude Code / DeepSeek Harness (npm)
 ├── host/                     # tools you run on the host
-│   ├── devbox                # the one entry point: devbox build | create | memory | agent install | agent refresh
+│   ├── devbox                # the one entry point: devbox build | create | key | memory | agent install | agent refresh
 │   └── devbox_lib/           # modules behind it (not run directly)
 │       ├── container.py      # `devbox create`: interactive container creation
 │       ├── image.py          # `devbox build`: build and tag the image from VERSION
+│       ├── keys.py           # `devbox key add | list | remove`: SSH public keys a container authorizes
 │       ├── memory.py         # `devbox memory` + the 8/16/32/64 GiB profiles `devbox create` also uses
 │       └── ssh_agent.py      # `devbox agent`: persistent agent install, legacy per-container proxy
 ├── docs/
@@ -508,6 +548,7 @@ Cuda-Dev-Box/
     ├── test_setup_typescript.py
     ├── test_create_docker.py
     ├── test_devbox_build.py
+    ├── test_devbox_key.py
     ├── test_image_scripts.py
     ├── test_memory_profiles.py
     ├── test_persistence_docker.py   # needs a built image: DEVBOX_TEST_IMAGE=cuda-devbox:latest
@@ -521,7 +562,7 @@ Run `python3 -m unittest discover -s tests` for the host tests. To also verify p
 DEVBOX_TEST_IMAGE=cuda-devbox:latest python3 -m unittest discover -s tests -v
 ```
 
-The optional Docker test uses temporary directories and offline containers, installs a local npm fixture, then deletes and recreates a container to check state, commands, and the SSH login environment.
+The optional Docker tests use temporary directories and offline containers. The persistence test mounts an empty home as `/root` the way `devbox create` does, installs a local npm fixture, then deletes and recreates the container to check that the home, the commands installed into it, and the SSH login environment survive while the image's tools and Python need nothing from the home.
 
 ---
 
@@ -564,7 +605,7 @@ CUDA Toolkit and the surrounding environment come from NVIDIA's official `devel`
 
 | Language | Version | Install method |
 | --- | --- | --- |
-| Python | 3.14 | uv |
+| Python | 3.14 | uv, into `/opt/uv/python` (linked from `/usr/local/bin`) |
 | Rust | latest stable at build time | official Rust image (rustup, cargo, rustc) + rustfmt/clippy |
 | Go | latest stable | official Go image |
 | Java | OpenJDK 25 LTS | official Eclipse Temurin image |
@@ -590,7 +631,7 @@ The base image doesn't pre-install Python project dependencies or create a virtu
 
 The image pre-installs both CLIs from their official npm packages, [`@openai/codex`](https://www.npmjs.com/package/@openai/codex) and [`@anthropic-ai/claude-code`](https://code.claude.com/docs/en/setup#install-with-npm). No token or API key is baked in. Each package carries the same native binary as the standalone installer, pulled in as a per-platform optional dependency. They install into `/usr/local/lib/node_modules`, with `codex` and `claude` in `/usr/local/bin`, reachable from SSH and non-login shells alike. The build runs `codex --version` and `claude --version` to verify them.
 
-After building, run `codex` and `claude` at container runtime to log in / configure each one. `devbox create` persists their user state and uses a separate npm prefix for later installs (see [AI state and npm packages](#ai-state-and-npm-packages)). To update inside the container, run `npm install -g @openai/codex@latest` or `npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code@latest`; those copies survive recreation and take precedence over the image's bundled versions. The mounts leave `/usr/local` and the Python runtime under `/root/.local` visible. Cursor isn't installed via npm here, since the npm package of the same name isn't the official Cursor CLI.
+After building, run `codex` and `claude` at container runtime to log in / configure each one. `devbox create` persists their user state and uses a separate npm prefix for later installs (see [AI state and npm packages](#ai-state-and-npm-packages)). To update inside the container, run `npm install -g @openai/codex@latest` or `npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code@latest`; those copies survive recreation and take precedence over the image's bundled versions. The image's own tools, the default Python included, live outside `/root`, so the mounted home never hides them. Cursor isn't installed via npm here, since the npm package of the same name isn't the official Cursor CLI.
 
 ### DeepSeek Harness
 
@@ -602,15 +643,15 @@ Start the Web UI inside the container:
 dsh web --no-open
 ```
 
-Forward its loopback port over SSH from your computer (replace `2222` with the container's published SSH port):
+Forward its loopback port over SSH from your computer, using the `my-docker-dev` entry from [SSH](#ssh):
 
 ```bash
-ssh -N -L 3080:127.0.0.1:3080 -p 2222 root@localhost
+ssh -N -L 3080:127.0.0.1:3080 my-docker-dev
 ```
 
 Open the full `http://127.0.0.1:3080/?token=...` URL printed by `dsh`. The launch token signs the browser in. In **Settings → Models**, enter your DeepSeek API key, then choose a workspace. See the [official Web UI guide](https://deepseek-harness.github.io/deepseek-harness/en/guide/quickstart). VS Code port forwarding can also forward container port `3080`.
 
-`devbox create` persists Harness's default `/root/.dsh` directory, including credentials and profiles, using the `.dsh` bind mount above. Keep the default `DSH_HOME` to use this mount. To update at runtime, run `npm install -g --registry=https://registry.npmjs.org --allow-scripts=@deepseek-ai/dsh-subprocess-local,node-pty,koffi,protobufjs,@google/genai @deepseek-ai/dsh@latest`; the updated CLI uses the persisted npm prefix.
+`devbox create` persists Harness's default `/root/.dsh` directory, including credentials and profiles, as part of the home. Keep `DSH_HOME` inside `/root` so it stays there. To update at runtime, run `npm install -g --registry=https://registry.npmjs.org --allow-scripts=@deepseek-ai/dsh-subprocess-local,node-pty,koffi,protobufjs,@google/genai @deepseek-ai/dsh@latest`; the updated CLI uses the persisted npm prefix.
 
 ### Slow or failing AI CLI downloads
 
@@ -631,23 +672,6 @@ host/devbox build --build-arg PYTHON_VERSION=3.13
 ### Adding a Python package
 
 Inside a specific project, run `uv add <package>`, then `uv sync` to reproduce the project's environment — no need to rebuild the base image.
-
-### Setting the SSH root password
-
-`devbox create` sets the root password after the container starts. If you set a host environment variable, that value is used and never echoed:
-
-```bash
-export DOCKER_SSH_ROOT_PASSWORD='your-password'
-host/devbox create
-```
-
-Without `DOCKER_SSH_ROOT_PASSWORD` set, the script generates a random password and shows it in the terminal exactly once. To reset it later:
-
-```bash
-docker exec -it <container-name> passwd root
-```
-
-> **Security note**: never hardcode a password in `setup_ssh.sh` or the Dockerfile — a build-time password would end up baked into the image state or its build history.
 
 ### Cursor / Claude Code sandbox errors
 
@@ -672,7 +696,7 @@ docker stop <container-name>
 # Start an existing container
 docker start <container-name>
 
-# Remove the container (data in the mounted directories is preserved)
+# Remove the container (its home in ~/docker_mount is preserved)
 docker rm -f <container-name>
 
 # View container logs
