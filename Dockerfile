@@ -213,7 +213,8 @@ ENV CLAUDE_CONFIG_DIR="/root/.claude" \
     NPM_CONFIG_USERCONFIG="/root/.npm/npmrc"
 ENV PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
 
-# Inject Dockerfile ENV values into SSH/login and interactive Bash shells.
+# Pass Dockerfile ENV values to SSH sessions (sshd SetEnv), with a profile
+# fallback that fills in values a shell is missing.
 COPY image/setup_env.sh /tmp/setup_env.sh
 RUN chmod +x /tmp/setup_env.sh && /tmp/setup_env.sh && rm /tmp/setup_env.sh
 

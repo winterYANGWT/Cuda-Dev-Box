@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 set_sshd_option() {
     local key="$1"
@@ -21,8 +21,6 @@ set_sshd_option StrictModes no
 
 # Every SSH session, `ssh box command` included, uses the image's locale
 # (C.UTF-8 from the Dockerfile ENV; being UTF-8 it handles any language's text).
-# The client's LANG/LC_* are not accepted: login shells reset them anyway, so
-# accepting them only made non-interactive sessions behave differently.
-: "${LANG:?LANG must be set}" "${LC_ALL:?LC_ALL must be set}"
+# setup_env.sh sets it, with the rest of the ENV, through sshd's SetEnv. The
+# client's LANG/LC_* are not accepted, so sessions do not differ by client.
 set_sshd_option AcceptEnv "COLORTERM NO_COLOR"
-set_sshd_option SetEnv "LANG=${LANG} LC_ALL=${LC_ALL}"

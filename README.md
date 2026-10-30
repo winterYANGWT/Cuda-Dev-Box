@@ -48,7 +48,7 @@ Every host-side task goes through one command, `host/devbox` (`host/devbox --hel
 | Base image | NVIDIA CUDA 13.3.1 cuDNN devel / Ubuntu 26.04 (Resolute Raccoon) |
 | Package sources | Official upstreams only (apt, rustup, npm, Maven/Gradle); no mirrors configured |
 | Compiler | Clang by default; GCC also available |
-| SSH | Configured; root login by password and/or key |
+| SSH | Configured; root login by password and/or key. Every SSH session, `ssh <container> <command>` and VS Code's remote server included, gets the same tool environment (`PATH`, `CUDA_HOME`, `JAVA_HOME`, ...) as `docker exec`, from sshd's `SetEnv` |
 | GPU | CUDA 13.3.1 + cuDNN; select all GPUs (default), individual indices, or ranges when Docker GPU support is available |
 | Timezone | Asia/Tokyo |
 | Locale | `C.UTF-8` everywhere: `docker exec`, SSH logins, and `ssh <container> <command>` alike. It is UTF-8, so Chinese, Japanese, and other text work; dates, sorting, and messages follow English/POSIX conventions. The SSH client's `LANG`/`LC_*` are not accepted. `en_US.UTF-8` is also generated for programs that ask for it by name |
@@ -89,7 +89,7 @@ The build is split into layers. uv, Go, JDK, Maven, Gradle, Node.js, Docker, Rus
 | --- | --- |
 | `Dockerfile` | Main build file; copies uv/Go/JDK/Maven/Gradle/Node.js/Docker/Rust from their official images |
 | `image/setup_cpp_libs.sh` | C/C++ system libraries (Boost, spdlog, GoogleTest, etc.) |
-| `image/setup_env.sh` | Injects Docker `ENV` values into SSH/login and interactive shells |
+| `image/setup_env.sh` | Passes Docker `ENV` values to SSH sessions through sshd's `SetEnv`, plus a shell fallback (`/etc/profile.d/dev-tools.sh`) that only fills in values a shell is missing, so a venv's or VS Code's `PATH` entries are kept |
 | `image/setup_ssh.sh` | SSH daemon configuration |
 | `image/setup_rust.sh` | Adds rustfmt/clippy to the Rust toolchain copied from the official image |
 | `image/setup_jvm.sh` | Kotlin install and JVM tool entrypoints |
@@ -489,7 +489,7 @@ Cuda-Dev-Box/
 ├── VERSION                   # image version for `devbox build`: YYYYMM or YYYYMM-N
 ├── image/                    # setup scripts the Dockerfile copies in and runs (never run by hand)
 │   ├── setup_cpp_libs.sh     # C/C++ library install (incl. GoogleTest)
-│   ├── setup_env.sh          # unified dev-tool shell environment injection
+│   ├── setup_env.sh          # Docker ENV for SSH sessions (sshd SetEnv) and shells
 │   ├── setup_jvm.sh          # Kotlin install and JVM tool entrypoints
 │   ├── setup_python.sh       # uv-managed Python 3.14 install
 │   ├── setup_rust.sh         # rustfmt/clippy on top of the copied Rust toolchain
@@ -508,10 +508,11 @@ Cuda-Dev-Box/
     ├── test_setup_typescript.py
     ├── test_create_docker.py
     ├── test_devbox_build.py
+    ├── test_image_scripts.py
     ├── test_memory_profiles.py
     ├── test_persistence_docker.py   # needs a built image: DEVBOX_TEST_IMAGE=cuda-devbox:latest
     ├── test_ssh_agent.py
-    └── test_ssh_locale_docker.py    # needs a built image, likewise
+    └── test_ssh_env_docker.py       # needs a built image, likewise
 ```
 
 Run `python3 -m unittest discover -s tests` for the host tests. To also verify persistence against a rebuilt image, run:
@@ -573,7 +574,7 @@ CUDA Toolkit and the surrounding environment come from NVIDIA's official `devel`
 | Node.js | LTS | official Node image |
 | TypeScript | latest | npm global |
 
-The JVM environment (`JAVA_HOME`, `MAVEN_HOME`, `GRADLE_HOME`, `KOTLIN_HOME`, and their `bin` directories on `PATH`) reaches SSH sessions through `/etc/profile.d/dev-tools.sh`, which `setup_env.sh` writes from the Dockerfile `ENV` values; `mvn`, `gradle`, `kotlin`, `kotlinc` are also symlinked into `/usr/local/bin`.
+The JVM environment (`JAVA_HOME`, `MAVEN_HOME`, `GRADLE_HOME`, `KOTLIN_HOME`, and their `bin` directories on `PATH`) reaches SSH sessions through sshd's `SetEnv` (`/etc/ssh/sshd_config.d/devbox-env.conf`), which `setup_env.sh` writes from the Dockerfile `ENV` values; `mvn`, `gradle`, `kotlin`, `kotlinc` are also symlinked into `/usr/local/bin`.
 
 Rust lives in `CARGO_HOME=/usr/local/cargo` and `RUSTUP_HOME=/usr/local/rustup`, the same paths as the official image. The official image pins its default toolchain to an exact version (for example `1.98.1`) rather than the `stable` channel, so `rustup update` won't move it. Rebuild with a newer `RUST_TAG`, or run `rustup default stable` in the container to track stable (that downloads a full toolchain). rustfmt and clippy are installed; the offline docs (`rust-docs`) aren't.
 
