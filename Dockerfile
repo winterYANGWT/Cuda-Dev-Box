@@ -166,6 +166,7 @@ ENV PATH="$JAVA_HOME/bin:$MAVEN_HOME/bin:$GRADLE_HOME/bin:$KOTLIN_HOME/bin:$PATH
 RUN java --version && javac --version && mvn --version && gradle --version && kotlinc -version
 
 # Install the default Python runtime with uv. Project environments are created later with uv sync.
+# ~/.local/bin holds commands installed later (uv tool, pip --user) in the persisted home.
 ENV PATH="/root/.local/bin:$PATH"
 COPY --from=uv-sdk /uv /uvx /usr/local/bin/
 COPY image/setup_python.sh /tmp/setup_python.sh
@@ -205,13 +206,15 @@ COPY --from=docker-sdk /usr/local/bin/docker /usr/local/bin/dockerd /usr/local/b
 COPY --from=docker-sdk /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
 RUN docker --version && dockerd --version && docker buildx version && docker compose version
 
-# Runtime installs and AI state live in directories persisted by devbox create.
-# Set the npm prefix only AFTER image tools are installed in /usr/local, so an
-# empty mount cannot hide them. User-installed commands take precedence.
+# Runtime installs and AI state live in /root, which devbox create persists.
+# Set the npm prefix and cargo install root only AFTER image tools are installed
+# in /usr/local, so an empty home cannot hide them. User-installed commands take
+# precedence. The cargo registry cache stays in CARGO_HOME, outside the home.
 ENV CLAUDE_CONFIG_DIR="/root/.claude" \
     NPM_CONFIG_PREFIX="/root/.npm-global" \
-    NPM_CONFIG_USERCONFIG="/root/.npm/npmrc"
-ENV PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+    NPM_CONFIG_USERCONFIG="/root/.npm/npmrc" \
+    CARGO_INSTALL_ROOT="/root/.cargo"
+ENV PATH="$CARGO_INSTALL_ROOT/bin:$NPM_CONFIG_PREFIX/bin:$PATH"
 
 # Pass Dockerfile ENV values to SSH sessions (sshd SetEnv), with a profile
 # fallback that fills in values a shell is missing.
@@ -223,3 +226,7 @@ RUN chmod +x /tmp/setup_env.sh && /tmp/setup_env.sh && rm /tmp/setup_env.sh
 # leaves the label empty.
 ARG IMAGE_VERSION
 LABEL org.opencontainers.image.version="${IMAGE_VERSION}"
+# Nothing the image needs lives in /root, so devbox create may mount the whole
+# home from the host. Older images kept the default Python there; create asks
+# before using an image without this label.
+LABEL cuda-devbox.persistent-home="true"

@@ -9,7 +9,7 @@ names=(
     PATH CUDA_HOME LIBRARY_PATH LD_LIBRARY_PATH
     GOROOT CARGO_HOME RUSTUP_HOME
     JAVA_HOME MAVEN_HOME GRADLE_HOME KOTLIN_HOME
-    CLAUDE_CONFIG_DIR NPM_CONFIG_PREFIX NPM_CONFIG_USERCONFIG
+    CLAUDE_CONFIG_DIR NPM_CONFIG_PREFIX NPM_CONFIG_USERCONFIG CARGO_INSTALL_ROOT
     TZ LANG LANGUAGE LC_ALL CC CXX
 )
 for name in "${names[@]}"; do
@@ -70,7 +70,8 @@ PROFILE_TAIL
 } > "$profile"
 chmod 0644 "$profile"
 
-# Non-login interactive shells (VS Code terminals) read only ~/.bashrc; they
-# need the SSH_AUTH_SOCK fallback above.
+# Non-login interactive shells (VS Code terminals) skip /etc/profile.d; they
+# need the SSH_AUTH_SOCK fallback above. The system bashrc, not /root/.bashrc,
+# because devbox create mounts the home from the host.
 bashrc_line='[ -r /etc/profile.d/dev-tools.sh ] && . /etc/profile.d/dev-tools.sh'
-grep -qxF "$bashrc_line" /root/.bashrc || echo "$bashrc_line" >> /root/.bashrc
+grep -qxF "$bashrc_line" /etc/bash.bashrc || echo "$bashrc_line" >> /etc/bash.bashrc
