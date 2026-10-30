@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # node is copied from the official Node image in the Dockerfile. npm/npx/corepack
 # are normally symlinks into lib/node_modules that resolve relative requires from
